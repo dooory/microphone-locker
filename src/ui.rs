@@ -174,6 +174,8 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
             let footer_height = 24.0;
             let list_height = (ui.available_height() - footer_height).max(80.0);
 
+            let mut pending_commands = Vec::new();
+
             egui::ScrollArea::vertical()
                 .max_height(list_height)
                 .auto_shrink([false, false])
@@ -184,11 +186,19 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
                         );
                     } else {
                         for mic in &snapshot.active_microphones {
-                            render_microphone_row(ui, mic);
+                            if let Some(cmd) =
+                                render_microphone_row(ui, mic, snapshot.default_volume)
+                            {
+                                pending_commands.push(cmd);
+                            }
                             ui.add_space(6.0);
                         }
                     }
                 });
+
+            for cmd in pending_commands {
+                self.send_command(cmd);
+            }
 
             ui.add_space(4.0);
             ui.label(
@@ -202,42 +212,83 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
     }
 }
 
-fn render_microphone_row(ui: &mut egui::Ui, mic: &MicrophoneSnapshot) {
+fn render_microphone_row(
+    ui: &mut egui::Ui,
+    mic: &MicrophoneSnapshot,
+    default_volume: u8,
+) -> Option<AppCommand> {
     let current_percent = (mic.current_volume_scalar.clamp(0.0, 1.0) * 100.0).round() as u8;
+    let is_ignored = mic.lock_policy == LockPolicy::Ignored;
+    let is_custom = matches!(mic.lock_policy, LockPolicy::Custom(_));
+    let mut command = None;
 
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.strong(&mic.friendly_name);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let target_label = match mic.effective_target_volume {
-                    Some(target) => format!("Target: {target}%"),
-                    None => "Ignored".to_string(),
+    ui.push_id(&mic.endpoint_id, |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.strong(&mic.friendly_name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut ignored = is_ignored;
+                    if ui.checkbox(&mut ignored, "Ignored").changed() {
+                        let next_policy = if ignored {
+                            LockPolicy::Ignored
+                        } else {
+                            LockPolicy::FollowDefault
+                        };
+                        command = Some(AppCommand::SetMicrophoneLockPolicy {
+                            endpoint_id: mic.endpoint_id.clone(),
+                            lock_policy: next_policy,
+                        });
+                    }
+                });
+            });
+
+            ui.horizontal(|ui| {
+                let policy_text = match mic.lock_policy {
+                    LockPolicy::FollowDefault => format!("Following Default ({default_volume}%)"),
+                    LockPolicy::Custom(target) => format!("Custom Target Volume ({target}%)"),
+                    LockPolicy::Ignored => "Ignored (not enforced)".to_string(),
                 };
-                ui.strong(target_label);
+                ui.label(egui::RichText::new(policy_text).small().weak());
+
+                if is_custom && ui.small_button("Reset to Default").clicked() {
+                    command = Some(AppCommand::SetMicrophoneLockPolicy {
+                        endpoint_id: mic.endpoint_id.clone(),
+                        lock_policy: LockPolicy::FollowDefault,
+                    });
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Current: {current_percent}%"))
+                            .small()
+                            .weak(),
+                    );
+                });
+            });
+
+            ui.add_space(4.0);
+
+            let displayed_target = mic.effective_target_volume.unwrap_or(current_percent);
+            let mut slider_value = displayed_target;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Target Volume").small());
+                ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(120.0);
+                let slider = egui::Slider::new(&mut slider_value, 0..=100)
+                    .suffix("%")
+                    .integer();
+                if ui.add_enabled(!is_ignored, slider).changed()
+                    && slider_value != displayed_target
+                {
+                    command = Some(AppCommand::SetMicrophoneLockPolicy {
+                        endpoint_id: mic.endpoint_id.clone(),
+                        lock_policy: LockPolicy::Custom(slider_value),
+                    });
+                }
             });
         });
-
-        ui.horizontal(|ui| {
-            let policy_text = match mic.lock_policy {
-                LockPolicy::FollowDefault => "Following Default",
-                LockPolicy::Custom(_) => "Custom Target Volume",
-                LockPolicy::Ignored => "Ignored (not enforced)",
-            };
-            ui.label(egui::RichText::new(policy_text).small().weak());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(format!("Current: {current_percent}%"))
-                        .small()
-                        .weak(),
-                );
-            });
-        });
-
-        ui.add_space(4.0);
-        ui.add(
-            egui::ProgressBar::new(mic.current_volume_scalar.clamp(0.0, 1.0))
-                .desired_height(6.0),
-        );
     });
+
+    command
 }
