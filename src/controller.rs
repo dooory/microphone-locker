@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::audio::{ActiveMicrophone, AudioBackend, AudioError, AudioEvent};
 use crate::config::{AppConfig, ConfigError, LockPolicy, MicrophoneConfig, load_config, save_config};
+use crate::startup::{NoopStartupRegistry, StartupError, StartupRegistry};
 
 /// Sub-0.5% scalar tolerance to avoid revert loops from audio driver quantization.
 pub const VOLUME_TOLERANCE: f32 = 0.005;
@@ -17,6 +18,8 @@ pub enum ControllerError {
     Audio(#[from] AudioError),
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    Startup(#[from] StartupError),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,44 +34,57 @@ pub struct MicrophoneSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     SetDefaultVolume(u8),
+    SetStartWithWindows(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppSnapshot {
     pub default_volume: u8,
+    pub start_with_windows: bool,
     pub active_microphones: Vec<MicrophoneSnapshot>,
 }
 
-pub struct AppController<B: AudioBackend> {
+pub struct AppController<B: AudioBackend, S: StartupRegistry = NoopStartupRegistry> {
     backend: B,
+    startup: S,
     config_path: PathBuf,
     config: AppConfig,
     active_microphones: BTreeMap<String, ActiveMicrophone>,
     open_window_on_startup: bool,
+    start_with_windows: bool,
 }
 
-impl<B: AudioBackend> AppController<B> {
+impl<B: AudioBackend> AppController<B, NoopStartupRegistry> {
     pub fn start(backend: B, config_path: PathBuf) -> Result<Self, ControllerError> {
+        Self::start_with_startup(backend, NoopStartupRegistry, config_path)
+    }
+}
+
+impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
+    pub fn start_with_startup(
+        backend: B,
+        startup: S,
+        config_path: PathBuf,
+    ) -> Result<Self, ControllerError> {
         let (config, open_window_on_startup) = match load_config(&config_path)? {
             Some(existing) => (existing, false),
             None => (AppConfig::initial_default(), true),
         };
+        let start_with_windows = startup.is_enabled()?;
 
         let mut controller = Self {
             backend,
+            startup,
             config_path,
             config,
             active_microphones: BTreeMap::new(),
             open_window_on_startup,
+            start_with_windows,
         };
 
-        let active = controller.backend.list_active_microphones()?;
         let mut config_dirty = open_window_on_startup;
-
-        for mic in active {
-            if controller.activate_microphone(mic)? {
-                config_dirty = true;
-            }
+        if controller.reconcile_active_microphones()? {
+            config_dirty = true;
         }
 
         if config_dirty {
@@ -112,6 +128,13 @@ impl<B: AudioBackend> AppController<B> {
                         mic.volume_scalar = enforced_scalar;
                     }
                 }
+            }
+            AppCommand::SetStartWithWindows(enabled) => {
+                if self.start_with_windows == enabled {
+                    return Ok(());
+                }
+                self.startup.set_enabled(enabled)?;
+                self.start_with_windows = enabled;
             }
         }
         Ok(())
@@ -162,6 +185,11 @@ impl<B: AudioBackend> AppController<B> {
                     save_config(&self.config_path, &self.config)?;
                 }
             }
+            AudioEvent::SystemWake => {
+                if self.reconcile_active_microphones()? {
+                    save_config(&self.config_path, &self.config)?;
+                }
+            }
         }
         Ok(())
     }
@@ -191,8 +219,23 @@ impl<B: AudioBackend> AppController<B> {
 
         AppSnapshot {
             default_volume: self.config.default_volume,
+            start_with_windows: self.start_with_windows,
             active_microphones,
         }
+    }
+
+    fn reconcile_active_microphones(&mut self) -> Result<bool, AudioError> {
+        let active = self.backend.list_active_microphones()?;
+        self.active_microphones.clear();
+
+        let mut config_dirty = false;
+        for mic in active {
+            if self.activate_microphone(mic)? {
+                config_dirty = true;
+            }
+        }
+
+        Ok(config_dirty)
     }
 
     fn activate_microphone(&mut self, mut mic: ActiveMicrophone) -> Result<bool, AudioError> {

@@ -8,13 +8,15 @@ use eframe::egui;
 use crate::audio::AudioBackend;
 use crate::config::LockPolicy;
 use crate::controller::{AppCommand, AppController, AppSnapshot, MicrophoneSnapshot};
+use crate::startup::StartupRegistry;
 use crate::tray::{SystemTray, TrayAction, window_icon_data};
 
 /// Runs the native Windows system tray + `egui` settings window event loop.
-pub fn run_app<B: AudioBackend + 'static>(
-    controller: Arc<Mutex<AppController<B>>>,
+pub fn run_app<B: AudioBackend + 'static, S: StartupRegistry + 'static>(
+    controller: Arc<Mutex<AppController<B, S>>>,
     open_window_on_startup: bool,
     egui_ctx_slot: Arc<OnceLock<egui::Context>>,
+    show_window_rx: Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let viewport = egui::ViewportBuilder::default()
         .with_title("Microphone Locker")
@@ -39,6 +41,7 @@ pub fn run_app<B: AudioBackend + 'static>(
                 controller,
                 _tray: tray,
                 tray_rx,
+                show_window_rx,
                 hide_on_first_frame: !open_window_on_startup,
                 quitting: false,
                 last_error: None,
@@ -49,16 +52,17 @@ pub fn run_app<B: AudioBackend + 'static>(
     Ok(())
 }
 
-struct SettingsApp<B: AudioBackend> {
-    controller: Arc<Mutex<AppController<B>>>,
+struct SettingsApp<B: AudioBackend, S: StartupRegistry> {
+    controller: Arc<Mutex<AppController<B, S>>>,
     _tray: SystemTray,
     tray_rx: Receiver<TrayAction>,
+    show_window_rx: Receiver<()>,
     hide_on_first_frame: bool,
     quitting: bool,
     last_error: Option<String>,
 }
 
-impl<B: AudioBackend> SettingsApp<B> {
+impl<B: AudioBackend, S: StartupRegistry> SettingsApp<B, S> {
     fn snapshot(&self) -> Option<AppSnapshot> {
         self.controller.lock().ok().map(|ctrl| ctrl.snapshot())
     }
@@ -75,13 +79,17 @@ impl<B: AudioBackend> SettingsApp<B> {
         }
     }
 
+    fn show_and_focus_window(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
     fn drain_tray_actions(&mut self, ctx: &egui::Context) {
         while let Ok(action) = self.tray_rx.try_recv() {
             match action {
                 TrayAction::ShowWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    Self::show_and_focus_window(ctx);
                 }
                 TrayAction::Quit => {
                     self.quitting = true;
@@ -90,9 +98,19 @@ impl<B: AudioBackend> SettingsApp<B> {
             }
         }
     }
+
+    fn drain_show_window_signals(&mut self, ctx: &egui::Context) {
+        let mut requested = false;
+        while self.show_window_rx.try_recv().is_ok() {
+            requested = true;
+        }
+        if requested {
+            Self::show_and_focus_window(ctx);
+        }
+    }
 }
 
-impl<B: AudioBackend> eframe::App for SettingsApp<B> {
+impl<B: AudioBackend, S: StartupRegistry> eframe::App for SettingsApp<B, S> {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.hide_on_first_frame {
             self.hide_on_first_frame = false;
@@ -100,6 +118,7 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
         }
 
         self.drain_tray_actions(ctx);
+        self.drain_show_window_signals(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -163,6 +182,19 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
                     }
                 }
             });
+
+            ui.add_space(8.0);
+            let mut start_with_windows = snapshot.start_with_windows;
+            if ui
+                .checkbox(&mut start_with_windows, "Start with Windows")
+                .changed()
+                && start_with_windows != snapshot.start_with_windows
+            {
+                self.send_command(AppCommand::SetStartWithWindows(start_with_windows));
+                if let Some(updated) = self.snapshot() {
+                    snapshot = updated;
+                }
+            }
 
             ui.add_space(12.0);
             ui.strong(format!(

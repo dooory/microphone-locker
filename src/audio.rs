@@ -25,6 +25,7 @@ pub enum AudioEvent {
         endpoint_id: String,
         friendly_name: String,
     },
+    SystemWake,
 }
 
 #[derive(Debug, Error)]

@@ -6,6 +6,7 @@ use microphone_locker::config::{ConfigError, LockPolicy};
 use microphone_locker::controller::{
     AppCommand, AppController, AppSnapshot, ControllerError, MicrophoneSnapshot,
 };
+use microphone_locker::startup::{StartupError, StartupRegistry};
 use tempfile::TempDir;
 
 fn microphones_by_id(snapshot: &AppSnapshot) -> HashMap<&str, &MicrophoneSnapshot> {
@@ -65,6 +66,32 @@ impl FakeAudioBackend {
             .iter()
             .find(|m| m.endpoint_id == endpoint_id)
             .map(|m| m.volume_scalar)
+    }
+
+    fn set_external_volume(&self, endpoint_id: &str, scalar: f32) {
+        if let Some(mic) = self
+            .state
+            .lock()
+            .unwrap()
+            .microphones
+            .iter_mut()
+            .find(|m| m.endpoint_id == endpoint_id)
+        {
+            mic.volume_scalar = scalar;
+        }
+    }
+
+    fn set_friendly_name(&self, endpoint_id: &str, friendly_name: &str) {
+        if let Some(mic) = self
+            .state
+            .lock()
+            .unwrap()
+            .microphones
+            .iter_mut()
+            .find(|m| m.endpoint_id == endpoint_id)
+        {
+            mic.friendly_name = friendly_name.to_string();
+        }
     }
 }
 
@@ -738,4 +765,214 @@ fn setting_default_volume_clamps_above_100_and_is_noop_when_unchanged() {
     );
     let saved_toml = std::fs::read_to_string(&config_path).unwrap();
     assert!(saved_toml.contains("default_volume = 0"));
+}
+
+#[derive(Debug, Default)]
+struct FakeStartupState {
+    enabled: bool,
+    set_calls: Vec<bool>,
+    fail_next_set: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FakeStartupRegistry {
+    state: Arc<Mutex<FakeStartupState>>,
+}
+
+impl FakeStartupRegistry {
+    fn new(initially_enabled: bool) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FakeStartupState {
+                enabled: initially_enabled,
+                set_calls: Vec::new(),
+                fail_next_set: false,
+            })),
+        }
+    }
+
+    fn set_calls(&self) -> Vec<bool> {
+        self.state.lock().unwrap().set_calls.clone()
+    }
+
+    fn set_fail_next(&self, fail: bool) {
+        self.state.lock().unwrap().fail_next_set = fail;
+    }
+}
+
+impl StartupRegistry for FakeStartupRegistry {
+    fn is_enabled(&self) -> Result<bool, StartupError> {
+        Ok(self.state.lock().unwrap().enabled)
+    }
+
+    fn set_enabled(&self, enabled: bool) -> Result<(), StartupError> {
+        let mut state = self.state.lock().unwrap();
+        state.set_calls.push(enabled);
+        if state.fail_next_set {
+            state.fail_next_set = false;
+            return Err(StartupError::Registry("simulated registry failure".to_string()));
+        }
+        state.enabled = enabled;
+        Ok(())
+    }
+}
+
+#[test]
+fn start_with_windows_queries_enables_disables_and_preserves_state_on_registry_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::default();
+    let startup = FakeStartupRegistry::new(false);
+
+    let mut controller =
+        AppController::start_with_startup(backend, startup.clone(), config_path).unwrap();
+
+    assert!(!controller.snapshot().start_with_windows);
+    assert!(startup.set_calls().is_empty());
+
+    // Enabling updates registry and snapshot.
+    controller
+        .handle_command(AppCommand::SetStartWithWindows(true))
+        .unwrap();
+    assert!(controller.snapshot().start_with_windows);
+    assert_eq!(startup.set_calls(), vec![true]);
+
+    // Redundant enable is a no-op.
+    controller
+        .handle_command(AppCommand::SetStartWithWindows(true))
+        .unwrap();
+    assert_eq!(startup.set_calls(), vec![true]);
+
+    // Registry error leaves snapshot unchanged and surfaces ControllerError::Startup.
+    startup.set_fail_next(true);
+    let err = controller
+        .handle_command(AppCommand::SetStartWithWindows(false))
+        .unwrap_err();
+    assert!(matches!(err, ControllerError::Startup(_)));
+    assert!(controller.snapshot().start_with_windows);
+
+    // Disabling succeeds when registry is healthy.
+    controller
+        .handle_command(AppCommand::SetStartWithWindows(false))
+        .unwrap();
+    assert!(!controller.snapshot().start_with_windows);
+    assert_eq!(startup.set_calls(), vec![true, false, false]);
+}
+
+#[test]
+fn start_with_windows_initial_state_reflects_existing_registry_entry() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::default();
+    let startup = FakeStartupRegistry::new(true);
+
+    let controller =
+        AppController::start_with_startup(backend, startup, config_path).unwrap();
+
+    assert!(controller.snapshot().start_with_windows);
+}
+
+#[test]
+fn system_wake_reconciles_all_active_locked_microphones_and_refreshes_device_roster() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 75
+
+[microphones."{0.0.1.00000000}.{mic-follow}"]
+friendly_name = "Blue Yeti"
+policy = "follow_default"
+
+[microphones."{0.0.1.00000000}.{mic-custom}"]
+friendly_name = "Shure SM7B"
+policy = "custom"
+target_volume = 50
+
+[microphones."{0.0.1.00000000}.{mic-ignored}"]
+friendly_name = "Virtual Cable"
+policy = "ignored"
+
+[microphones."{0.0.1.00000000}.{mic-unplugged}"]
+friendly_name = "Travel Headset"
+policy = "custom"
+target_volume = 60
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-follow}".to_string(),
+            friendly_name: "Blue Yeti".to_string(),
+            volume_scalar: 0.75,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-custom}".to_string(),
+            friendly_name: "Shure SM7B".to_string(),
+            volume_scalar: 0.50,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-ignored}".to_string(),
+            friendly_name: "Virtual Cable".to_string(),
+            volume_scalar: 0.30,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-unplugged}".to_string(),
+            friendly_name: "Travel Headset".to_string(),
+            volume_scalar: 0.60,
+        },
+    ]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    // Simulate changes occurring while Windows was asleep:
+    // - locked Microphones drifted
+    // - ignored Microphone changed
+    // - one Microphone was unplugged
+    // - a brand-new Microphone was plugged in
+    // - an existing Microphone's friendly name changed
+    backend.set_external_volume("{0.0.1.00000000}.{mic-follow}", 0.20);
+    backend.set_friendly_name("{0.0.1.00000000}.{mic-follow}", "Blue Yeti X");
+    backend.set_external_volume("{0.0.1.00000000}.{mic-custom}", 0.95);
+    backend.set_external_volume("{0.0.1.00000000}.{mic-ignored}", 0.10);
+    backend.remove_microphone("{0.0.1.00000000}.{mic-unplugged}");
+    backend.add_microphone(ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-new}".to_string(),
+        friendly_name: "Dock USB Mic".to_string(),
+        volume_scalar: 0.40,
+    });
+
+    controller.handle_event(AudioEvent::SystemWake).unwrap();
+
+    assert_eq!(
+        backend.set_calls(),
+        vec![
+            ("{0.0.1.00000000}.{mic-follow}".to_string(), 0.75),
+            ("{0.0.1.00000000}.{mic-custom}".to_string(), 0.50),
+            ("{0.0.1.00000000}.{mic-new}".to_string(), 0.75),
+        ]
+    );
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-follow}").unwrap() - 0.75).abs() < 1e-6);
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-custom}").unwrap() - 0.50).abs() < 1e-6);
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-ignored}").unwrap() - 0.10).abs() < 1e-6);
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-new}").unwrap() - 0.75).abs() < 1e-6);
+
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.active_microphones.len(), 4);
+    let by_id = microphones_by_id(&snapshot);
+    assert!(!by_id.contains_key("{0.0.1.00000000}.{mic-unplugged}"));
+    assert_eq!(by_id["{0.0.1.00000000}.{mic-follow}"].friendly_name, "Blue Yeti X");
+    assert!((by_id["{0.0.1.00000000}.{mic-ignored}"].current_volume_scalar - 0.10).abs() < 1e-6);
+    assert_eq!(by_id["{0.0.1.00000000}.{mic-new}"].lock_policy, LockPolicy::FollowDefault);
+    assert_eq!(by_id["{0.0.1.00000000}.{mic-new}"].effective_target_volume, Some(75));
+
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_toml.contains("Blue Yeti X"));
+    assert!(saved_toml.contains("Dock USB Mic"));
+    assert!(saved_toml.contains("Travel Headset"));
 }
