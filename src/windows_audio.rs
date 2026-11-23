@@ -20,8 +20,8 @@ use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
 use windows::Win32::Media::Audio::{
-    AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole,
-    IMMDevice, IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient, IMMNotificationClient_Impl,
+    AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole, IMMDevice,
+    IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient, IMMNotificationClient_Impl,
     MMDeviceEnumerator, eCapture,
 };
 use windows::Win32::System::Com::{
@@ -340,9 +340,7 @@ impl ComWorker {
                     friendly_name,
                     volume_scalar,
                 });
-            } else if let Ok((sub, mic)) =
-                subscribe_device(&device, &endpoint_id, &self.event_tx)
-            {
+            } else if let Ok((sub, mic)) = subscribe_device(&device, &endpoint_id, &self.event_tx) {
                 self.subscriptions.insert(endpoint_id, sub);
                 active_microphones.push(mic);
             }
@@ -560,13 +558,12 @@ fn subscribe_device(
 
     // SAFETY: Reading the initial scalar volume level (0.0..=1.0). If this fails,
     // `sub` drops and cleanly unregisters the callback.
-    let volume_scalar = unsafe { sub.endpoint_volume.GetMasterVolumeLevelScalar() }.map_err(
-        |err| {
+    let volume_scalar =
+        unsafe { sub.endpoint_volume.GetMasterVolumeLevelScalar() }.map_err(|err| {
             AudioError::Backend(format!(
                 "GetMasterVolumeLevelScalar failed for {endpoint_id}: {err}"
             ))
-        },
-    )?;
+        })?;
 
     let friendly_name = read_friendly_name(device).unwrap_or_else(|_| endpoint_id.to_string());
 

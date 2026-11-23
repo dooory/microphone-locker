@@ -126,12 +126,10 @@ impl AudioBackend for FakeAudioBackend {
 }
 
 #[test]
-fn first_run_initializes_default_volume_to_80_saves_config_enforces_active_microphones_and_opens_window() {
+fn first_run_initializes_default_volume_to_80_saves_config_enforces_active_microphones_and_opens_window()
+ {
     let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir
-        .path()
-        .join("MicrophoneLocker")
-        .join("config.toml");
+    let config_path = temp_dir.path().join("MicrophoneLocker").join("config.toml");
 
     let backend = FakeAudioBackend::with_microphones(vec![
         ActiveMicrophone {
@@ -160,9 +158,18 @@ fn first_run_initializes_default_volume_to_80_saves_config_enforces_active_micro
         by_id["{0.0.1.00000000}.{mic-a}"].lock_policy,
         LockPolicy::FollowDefault
     );
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-a}"].effective_target_volume, Some(80));
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-b}"].friendly_name, "Headset Mic");
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-b}"].effective_target_volume, Some(80));
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-a}"].effective_target_volume,
+        Some(80)
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-b}"].friendly_name,
+        "Headset Mic"
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-b}"].effective_target_volume,
+        Some(80)
+    );
 
     assert_eq!(backend.set_calls().len(), 2);
     assert!((backend.current_volume("{0.0.1.00000000}.{mic-a}").unwrap() - 0.80).abs() < 1e-6);
@@ -176,12 +183,10 @@ fn first_run_initializes_default_volume_to_80_saves_config_enforces_active_micro
 }
 
 #[test]
-fn subsequent_run_loads_saved_config_reconciles_microphones_starts_minimized_and_refreshes_friendly_name() {
+fn subsequent_run_loads_saved_config_reconciles_microphones_starts_minimized_and_refreshes_friendly_name()
+ {
     let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir
-        .path()
-        .join("MicrophoneLocker")
-        .join("config.toml");
+    let config_path = temp_dir.path().join("MicrophoneLocker").join("config.toml");
 
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -257,9 +262,30 @@ policy = "ignored"
     );
 
     assert_eq!(backend.set_calls().len(), 2);
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-follow}").unwrap() - 0.70).abs() < 1e-6);
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-custom}").unwrap() - 0.55).abs() < 1e-6);
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-ignored}").unwrap() - 0.15).abs() < 1e-6);
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-follow}")
+            .unwrap()
+            - 0.70)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-custom}")
+            .unwrap()
+            - 0.55)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-ignored}")
+            .unwrap()
+            - 0.15)
+            .abs()
+            < 1e-6
+    );
 
     let saved_toml = std::fs::read_to_string(&config_path).unwrap();
     assert!(saved_toml.contains("Blue Yeti Pro"));
@@ -604,7 +630,8 @@ target_volume = 55
 }
 
 #[test]
-fn setting_default_volume_updates_follow_default_microphones_preserves_custom_and_ignored_and_persists_across_reload() {
+fn setting_default_volume_updates_follow_default_microphones_preserves_custom_and_ignored_and_persists_across_reload()
+ {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
 
@@ -672,15 +699,35 @@ policy = "ignored"
     );
     assert!((backend.current_volume("{0.0.1.00000000}.{mic-a}").unwrap() - 0.65).abs() < 1e-6);
     assert!((backend.current_volume("{0.0.1.00000000}.{mic-b}").unwrap() - 0.65).abs() < 1e-6);
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-custom}").unwrap() - 0.55).abs() < 1e-6);
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-ignored}").unwrap() - 0.30).abs() < 1e-6);
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-custom}")
+            .unwrap()
+            - 0.55)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-ignored}")
+            .unwrap()
+            - 0.30)
+            .abs()
+            < 1e-6
+    );
 
     let snapshot = controller.snapshot();
     assert_eq!(snapshot.default_volume, 65);
     let by_id = microphones_by_id(&snapshot);
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-a}"].effective_target_volume, Some(65));
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-a}"].effective_target_volume,
+        Some(65)
+    );
     assert!((by_id["{0.0.1.00000000}.{mic-a}"].current_volume_scalar - 0.65).abs() < 1e-6);
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-b}"].effective_target_volume, Some(65));
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-b}"].effective_target_volume,
+        Some(65)
+    );
     assert!((by_id["{0.0.1.00000000}.{mic-b}"].current_volume_scalar - 0.65).abs() < 1e-6);
     assert_eq!(
         by_id["{0.0.1.00000000}.{mic-custom}"].lock_policy,
@@ -694,7 +741,10 @@ policy = "ignored"
         by_id["{0.0.1.00000000}.{mic-ignored}"].lock_policy,
         LockPolicy::Ignored
     );
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-ignored}"].effective_target_volume, None);
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-ignored}"].effective_target_volume,
+        None
+    );
 
     // Reload from disk with drifted microphone volumes and verify 65% persists and is enforced.
     let reload_backend = FakeAudioBackend::with_microphones(vec![
@@ -818,7 +868,9 @@ impl StartupRegistry for FakeStartupRegistry {
         state.set_calls.push(enabled);
         if state.fail_next_set {
             state.fail_next_set = false;
-            return Err(StartupError::Registry("simulated registry failure".to_string()));
+            return Err(StartupError::Registry(
+                "simulated registry failure".to_string(),
+            ));
         }
         state.enabled = enabled;
         Ok(())
@@ -876,8 +928,7 @@ fn start_with_windows_initial_state_reflects_existing_registry_entry() {
     let backend = FakeAudioBackend::default();
     let startup = FakeStartupRegistry::new(true);
 
-    let controller =
-        AppController::start_with_startup(backend, startup, config_path).unwrap();
+    let controller = AppController::start_with_startup(backend, startup, config_path).unwrap();
 
     assert!(controller.snapshot().start_with_windows);
 }
@@ -966,19 +1017,56 @@ target_volume = 60
             ("{0.0.1.00000000}.{mic-new}".to_string(), 0.75),
         ]
     );
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-follow}").unwrap() - 0.75).abs() < 1e-6);
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-custom}").unwrap() - 0.50).abs() < 1e-6);
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-ignored}").unwrap() - 0.10).abs() < 1e-6);
-    assert!((backend.current_volume("{0.0.1.00000000}.{mic-new}").unwrap() - 0.75).abs() < 1e-6);
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-follow}")
+            .unwrap()
+            - 0.75)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-custom}")
+            .unwrap()
+            - 0.50)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-ignored}")
+            .unwrap()
+            - 0.10)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (backend
+            .current_volume("{0.0.1.00000000}.{mic-new}")
+            .unwrap()
+            - 0.75)
+            .abs()
+            < 1e-6
+    );
 
     let snapshot = controller.snapshot();
     assert_eq!(snapshot.active_microphones.len(), 4);
     let by_id = microphones_by_id(&snapshot);
     assert!(!by_id.contains_key("{0.0.1.00000000}.{mic-unplugged}"));
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-follow}"].friendly_name, "Blue Yeti X");
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-follow}"].friendly_name,
+        "Blue Yeti X"
+    );
     assert!((by_id["{0.0.1.00000000}.{mic-ignored}"].current_volume_scalar - 0.10).abs() < 1e-6);
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-new}"].lock_policy, LockPolicy::FollowDefault);
-    assert_eq!(by_id["{0.0.1.00000000}.{mic-new}"].effective_target_volume, Some(75));
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-new}"].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-new}"].effective_target_volume,
+        Some(75)
+    );
 
     let saved_toml = std::fs::read_to_string(&config_path).unwrap();
     assert!(saved_toml.contains("Blue Yeti X"));
@@ -987,7 +1075,8 @@ target_volume = 60
 }
 
 #[test]
-fn setting_custom_target_volume_enforces_immediately_persists_to_toml_and_is_unaffected_by_default_volume_changes() {
+fn setting_custom_target_volume_enforces_immediately_persists_to_toml_and_is_unaffected_by_default_volume_changes()
+ {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
 
@@ -1187,7 +1276,8 @@ target_volume = 40
 }
 
 #[test]
-fn marking_microphone_as_ignored_stops_enforcement_persists_across_restart_and_unignoring_re_enforces() {
+fn marking_microphone_as_ignored_stops_enforcement_persists_across_restart_and_unignoring_re_enforces()
+ {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
 
@@ -1355,7 +1445,9 @@ fn unignoring_custom_microphone_restores_previous_custom_target_volume_across_pa
     backend.clear_set_calls();
 
     // Pause, then mark Ignored: remembers 45% in config.toml.
-    controller.handle_command(AppCommand::SetPaused(true)).unwrap();
+    controller
+        .handle_command(AppCommand::SetPaused(true))
+        .unwrap();
     controller
         .handle_command(AppCommand::SetMicrophoneIgnored {
             endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
@@ -1556,7 +1648,8 @@ policy = "ignored"
 }
 
 #[test]
-fn resuming_from_paused_immediately_reconciles_active_locked_microphones_and_leaves_ignored_untouched() {
+fn resuming_from_paused_immediately_reconciles_active_locked_microphones_and_leaves_ignored_untouched()
+ {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
 
@@ -1855,7 +1948,8 @@ policy = "ignored"
 }
 
 #[test]
-fn unplugged_microphones_move_to_disconnected_preserving_lock_policy_and_replug_restores_custom_and_ignored() {
+fn unplugged_microphones_move_to_disconnected_preserving_lock_policy_and_replug_restores_custom_and_ignored()
+ {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
 
@@ -2020,7 +2114,8 @@ policy = "follow_default"
 }
 
 #[test]
-fn forgetting_disconnected_microphone_deletes_it_from_state_and_config_so_replug_follows_default_volume() {
+fn forgetting_disconnected_microphone_deletes_it_from_state_and_config_so_replug_follows_default_volume()
+ {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
 
