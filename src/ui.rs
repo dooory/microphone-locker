@@ -39,7 +39,7 @@ pub fn run_app<B: AudioBackend + 'static>(
             let (tray, tray_rx) = SystemTray::build(cc.egui_ctx.clone())?;
             Ok(Box::new(SettingsApp {
                 controller,
-                _tray: tray,
+                tray,
                 tray_rx,
                 hide_on_first_frame: !open_window_on_startup,
                 quitting: false,
@@ -53,7 +53,7 @@ pub fn run_app<B: AudioBackend + 'static>(
 
 struct SettingsApp<B: AudioBackend> {
     controller: Arc<Mutex<AppController<B>>>,
-    _tray: SystemTray,
+    tray: SystemTray,
     tray_rx: Receiver<TrayAction>,
     hide_on_first_frame: bool,
     quitting: bool,
@@ -85,6 +85,11 @@ impl<B: AudioBackend> SettingsApp<B> {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                TrayAction::TogglePaused => {
+                    if let Some(snapshot) = self.snapshot() {
+                        self.send_command(AppCommand::SetPaused(!snapshot.paused));
+                    }
+                }
                 TrayAction::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -102,6 +107,10 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
         }
 
         self.drain_tray_actions(ctx);
+
+        if let Some(snapshot) = self.snapshot() {
+            self.tray.sync_paused(snapshot.paused);
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -139,6 +148,57 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
                 );
                 return;
             };
+
+            // Global temporary Paused toggle.
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        if snapshot.paused {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 155, 45),
+                                egui::RichText::new("Paused").strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Volume enforcement is temporarily suspended; Lock Policies are preserved.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(65, 175, 140),
+                                egui::RichText::new("Active").strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Enforcing Target Volumes on all locked Microphones.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let button_label = if snapshot.paused {
+                            "Resume Locking"
+                        } else {
+                            "Pause Locking"
+                        };
+                        if ui.button(button_label).clicked() {
+                            self.send_command(AppCommand::SetPaused(!snapshot.paused));
+                            if let Some(updated) = self.snapshot() {
+                                self.tray.sync_paused(updated.paused);
+                                snapshot = updated;
+                            }
+                        }
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
 
             // Global Default Volume control.
             egui::Frame::group(ui.style()).show(ui, |ui| {
