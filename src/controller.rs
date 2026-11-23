@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::audio::{ActiveMicrophone, AudioBackend, AudioError, AudioEvent};
-use crate::config::{AppConfig, ConfigError, LockPolicy, MicrophoneConfig, load_config, save_config};
+use crate::config::{
+    AppConfig, ConfigError, LockPolicy, MicrophoneConfig, load_config, save_config,
+};
 use crate::startup::{NoopStartupRegistry, StartupError, StartupRegistry};
 
 /// Sub-0.5% scalar tolerance to avoid revert loops from audio driver quantization.
@@ -241,11 +243,10 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                 if !self.active_microphones.contains_key(&endpoint_id) {
                     return Ok(());
                 }
-                let effective_scalar =
-                    match self.enforce_if_needed(&endpoint_id, volume_scalar)? {
-                        Some(enforced) => enforced,
-                        None => volume_scalar,
-                    };
+                let effective_scalar = match self.enforce_if_needed(&endpoint_id, volume_scalar)? {
+                    Some(enforced) => enforced,
+                    None => volume_scalar,
+                };
                 if let Some(mic) = self.active_microphones.get_mut(&endpoint_id) {
                     mic.volume_scalar = effective_scalar;
                 }
@@ -388,8 +389,7 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
             .active_microphones
             .get(endpoint_id)
             .map(|mic| mic.volume_scalar)
-            && let Some(enforced_scalar) =
-                self.enforce_if_needed(endpoint_id, current_scalar)?
+            && let Some(enforced_scalar) = self.enforce_if_needed(endpoint_id, current_scalar)?
             && let Some(mic) = self.active_microphones.get_mut(endpoint_id)
         {
             mic.volume_scalar = enforced_scalar;

@@ -392,8 +392,7 @@ fn render_microphone_row(
                 let slider = egui::Slider::new(&mut slider_value, 0..=100)
                     .suffix("%")
                     .integer();
-                if ui.add_enabled(!is_ignored, slider).changed()
-                    && slider_value != displayed_target
+                if ui.add_enabled(!is_ignored, slider).changed() && slider_value != displayed_target
                 {
                     command = Some(AppCommand::SetMicrophoneLockPolicy {
                         endpoint_id: mic.endpoint_id.clone(),

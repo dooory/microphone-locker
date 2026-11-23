@@ -105,7 +105,9 @@ impl StartupRegistry for WindowsStartupRegistry {
         buffer.truncate(byte_len as usize);
 
         let expected = format_run_command(&self.executable_path);
-        Ok(registry_value_matches_command(value_type, &buffer, &expected))
+        Ok(registry_value_matches_command(
+            value_type, &buffer, &expected,
+        ))
     }
 
     fn set_enabled(&self, enabled: bool) -> Result<(), StartupError> {
@@ -135,14 +137,12 @@ impl StartupRegistry for WindowsStartupRegistry {
                 .collect();
             // SAFETY: `wide` is a contiguous Vec<u16>; viewing its initialized bytes as `&[u8]`
             // is valid for `RegSetValueExW` with `REG_SZ`.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2) };
 
             // SAFETY: `hkey` is open with `KEY_SET_VALUE` and `bytes` is a NUL-terminated UTF-16 string.
-            let set_status = unsafe {
-                RegSetValueExW(hkey, APP_VALUE_NAME, Some(0), REG_SZ, Some(bytes))
-            };
+            let set_status =
+                unsafe { RegSetValueExW(hkey, APP_VALUE_NAME, Some(0), REG_SZ, Some(bytes)) };
             check_win32(set_status, "write MicrophoneLocker startup entry")?;
             Ok(())
         } else {
@@ -229,10 +229,7 @@ mod tests {
         if nul_terminated {
             units.push(0);
         }
-        units
-            .into_iter()
-            .flat_map(u16::to_le_bytes)
-            .collect()
+        units.into_iter().flat_map(u16::to_le_bytes).collect()
     }
 
     #[test]
@@ -272,12 +269,22 @@ mod tests {
         ));
 
         let other_path = encode_utf16_le_bytes(r#""D:\Other\microphone-locker.exe""#, true);
-        assert!(!registry_value_matches_command(REG_SZ, &other_path, expected));
+        assert!(!registry_value_matches_command(
+            REG_SZ,
+            &other_path,
+            expected
+        ));
 
         let empty_nul = encode_utf16_le_bytes("", true);
-        assert!(!registry_value_matches_command(REG_SZ, &empty_nul, expected));
+        assert!(!registry_value_matches_command(
+            REG_SZ, &empty_nul, expected
+        ));
 
         // Odd byte count is invalid UTF-16.
-        assert!(!registry_value_matches_command(REG_SZ, &[0x22, 0x00, 0x41], expected));
+        assert!(!registry_value_matches_command(
+            REG_SZ,
+            &[0x22, 0x00, 0x41],
+            expected
+        ));
     }
 }

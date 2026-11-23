@@ -214,7 +214,9 @@ mod tests {
 
         // Second acquisition detects existing instance and signals primary.
         match SingleInstanceGuard::acquire_named(&prefix).unwrap() {
-            InstanceLock::Primary(_) => panic!("second acquisition should detect existing instance"),
+            InstanceLock::Primary(_) => {
+                panic!("second acquisition should detect existing instance")
+            }
             InstanceLock::SecondarySignaled => {}
         }
 
