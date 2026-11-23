@@ -31,11 +31,13 @@ pub struct MicrophoneSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     SetDefaultVolume(u8),
+    SetPaused(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppSnapshot {
     pub default_volume: u8,
+    pub paused: bool,
     pub active_microphones: Vec<MicrophoneSnapshot>,
 }
 
@@ -43,6 +45,7 @@ pub struct AppController<B: AudioBackend> {
     backend: B,
     config_path: PathBuf,
     config: AppConfig,
+    paused: bool,
     active_microphones: BTreeMap<String, ActiveMicrophone>,
     open_window_on_startup: bool,
 }
@@ -58,6 +61,7 @@ impl<B: AudioBackend> AppController<B> {
             backend,
             config_path,
             config,
+            paused: false,
             active_microphones: BTreeMap::new(),
             open_window_on_startup,
         };
@@ -110,6 +114,28 @@ impl<B: AudioBackend> AppController<B> {
                         && let Some(mic) = self.active_microphones.get_mut(&endpoint_id)
                     {
                         mic.volume_scalar = enforced_scalar;
+                    }
+                }
+            }
+            AppCommand::SetPaused(paused) => {
+                if self.paused == paused {
+                    return Ok(());
+                }
+                self.paused = paused;
+                if !self.paused {
+                    let active_mics: Vec<(String, f32)> = self
+                        .active_microphones
+                        .values()
+                        .map(|mic| (mic.endpoint_id.clone(), mic.volume_scalar))
+                        .collect();
+
+                    for (endpoint_id, current_scalar) in active_mics {
+                        if let Some(enforced_scalar) =
+                            self.enforce_if_needed(&endpoint_id, current_scalar)?
+                            && let Some(mic) = self.active_microphones.get_mut(&endpoint_id)
+                        {
+                            mic.volume_scalar = enforced_scalar;
+                        }
                     }
                 }
             }
@@ -191,6 +217,7 @@ impl<B: AudioBackend> AppController<B> {
 
         AppSnapshot {
             default_volume: self.config.default_volume,
+            paused: self.paused,
             active_microphones,
         }
     }
@@ -235,6 +262,9 @@ impl<B: AudioBackend> AppController<B> {
         endpoint_id: &str,
         actual_scalar: f32,
     ) -> Result<Option<f32>, AudioError> {
+        if self.paused {
+            return Ok(None);
+        }
         let Some(entry) = self.config.microphones.get(endpoint_id) else {
             return Ok(None);
         };
