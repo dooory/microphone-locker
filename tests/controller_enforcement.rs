@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use microphone_locker::audio::{ActiveMicrophone, AudioBackend, AudioError, AudioEvent};
 use microphone_locker::config::{ConfigError, LockPolicy};
 use microphone_locker::controller::{
-    AppCommand, AppController, AppSnapshot, ControllerError, MicrophoneSnapshot,
+    AppCommand, AppController, AppSnapshot, ControllerError, DisconnectedMicrophoneSnapshot,
+    MicrophoneSnapshot,
 };
 use microphone_locker::startup::{StartupError, StartupRegistry};
 use tempfile::TempDir;
@@ -12,6 +13,14 @@ use tempfile::TempDir;
 fn microphones_by_id(snapshot: &AppSnapshot) -> HashMap<&str, &MicrophoneSnapshot> {
     snapshot
         .active_microphones
+        .iter()
+        .map(|m| (m.endpoint_id.as_str(), m))
+        .collect()
+}
+
+fn disconnected_by_id(snapshot: &AppSnapshot) -> HashMap<&str, &DisconnectedMicrophoneSnapshot> {
+    snapshot
+        .disconnected_microphones
         .iter()
         .map(|m| (m.endpoint_id.as_str(), m))
         .collect()
@@ -1662,4 +1671,318 @@ fn setting_microphone_lock_policy_while_paused_persists_without_enforcing_until_
         backend.set_calls(),
         vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.45)]
     );
+}
+
+#[test]
+fn unplugged_microphones_move_to_disconnected_preserving_lock_policy_and_replug_restores_custom_and_ignored() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 75
+
+[microphones."{0.0.1.00000000}.{mic-custom}"]
+friendly_name = "Blue Yeti"
+policy = "custom"
+target_volume = 55
+
+[microphones."{0.0.1.00000000}.{mic-ignored}"]
+friendly_name = "Virtual Cable"
+policy = "ignored"
+
+[microphones."{0.0.1.00000000}.{mic-already-offline}"]
+friendly_name = "Travel Headset"
+policy = "follow_default"
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-custom}".to_string(),
+            friendly_name: "Blue Yeti".to_string(),
+            volume_scalar: 0.55,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-ignored}".to_string(),
+            friendly_name: "Virtual Cable".to_string(),
+            volume_scalar: 0.30,
+        },
+    ]);
+
+    let mut controller = AppController::start(backend.clone(), config_path).unwrap();
+    backend.clear_set_calls();
+
+    // Microphone saved in config but not plugged in at startup is listed as Disconnected.
+    let initial = controller.snapshot();
+    assert_eq!(initial.active_microphones.len(), 2);
+    assert_eq!(initial.disconnected_microphones.len(), 1);
+    let initial_disc = disconnected_by_id(&initial);
+    assert_eq!(
+        initial_disc["{0.0.1.00000000}.{mic-already-offline}"].friendly_name,
+        "Travel Headset"
+    );
+    assert_eq!(
+        initial_disc["{0.0.1.00000000}.{mic-already-offline}"].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert_eq!(
+        initial_disc["{0.0.1.00000000}.{mic-already-offline}"].effective_target_volume,
+        Some(75)
+    );
+
+    // Unplug both active Microphones.
+    backend.remove_microphone("{0.0.1.00000000}.{mic-custom}");
+    controller
+        .handle_event(AudioEvent::MicrophoneDisconnected {
+            endpoint_id: "{0.0.1.00000000}.{mic-custom}".to_string(),
+        })
+        .unwrap();
+
+    backend.remove_microphone("{0.0.1.00000000}.{mic-ignored}");
+    controller
+        .handle_event(AudioEvent::MicrophoneDisconnected {
+            endpoint_id: "{0.0.1.00000000}.{mic-ignored}".to_string(),
+        })
+        .unwrap();
+
+    let after_disconnect = controller.snapshot();
+    assert!(after_disconnect.active_microphones.is_empty());
+    assert_eq!(after_disconnect.disconnected_microphones.len(), 3);
+
+    let disc = disconnected_by_id(&after_disconnect);
+    assert_eq!(
+        disc["{0.0.1.00000000}.{mic-custom}"].friendly_name,
+        "Blue Yeti"
+    );
+    assert_eq!(
+        disc["{0.0.1.00000000}.{mic-custom}"].lock_policy,
+        LockPolicy::Custom(55)
+    );
+    assert_eq!(
+        disc["{0.0.1.00000000}.{mic-custom}"].effective_target_volume,
+        Some(55)
+    );
+    assert_eq!(
+        disc["{0.0.1.00000000}.{mic-ignored}"].friendly_name,
+        "Virtual Cable"
+    );
+    assert_eq!(
+        disc["{0.0.1.00000000}.{mic-ignored}"].lock_policy,
+        LockPolicy::Ignored
+    );
+    assert_eq!(
+        disc["{0.0.1.00000000}.{mic-ignored}"].effective_target_volume,
+        None
+    );
+
+    // Replug Custom Microphone with drifted volume -> moves back to Active and immediately enforces 55%.
+    let custom_replugged = ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-custom}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.90,
+    };
+    backend.add_microphone(custom_replugged.clone());
+    controller
+        .handle_event(AudioEvent::MicrophoneConnected(custom_replugged))
+        .unwrap();
+
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-custom}".to_string(), 0.55)]
+    );
+
+    // Replug Ignored Microphone -> moves back to Active, keeps Ignored, does NOT alter volume.
+    backend.clear_set_calls();
+    let ignored_replugged = ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-ignored}".to_string(),
+        friendly_name: "Virtual Cable".to_string(),
+        volume_scalar: 0.25,
+    };
+    backend.add_microphone(ignored_replugged.clone());
+    controller
+        .handle_event(AudioEvent::MicrophoneConnected(ignored_replugged))
+        .unwrap();
+
+    assert!(backend.set_calls().is_empty());
+
+    let after_replug = controller.snapshot();
+    assert_eq!(after_replug.active_microphones.len(), 2);
+    assert_eq!(after_replug.disconnected_microphones.len(), 1);
+    assert_eq!(
+        after_replug.disconnected_microphones[0].endpoint_id,
+        "{0.0.1.00000000}.{mic-already-offline}"
+    );
+
+    let active_by_id = microphones_by_id(&after_replug);
+    assert_eq!(
+        active_by_id["{0.0.1.00000000}.{mic-custom}"].lock_policy,
+        LockPolicy::Custom(55)
+    );
+    assert_eq!(
+        active_by_id["{0.0.1.00000000}.{mic-custom}"].effective_target_volume,
+        Some(55)
+    );
+    assert_eq!(
+        active_by_id["{0.0.1.00000000}.{mic-ignored}"].lock_policy,
+        LockPolicy::Ignored
+    );
+    assert_eq!(
+        active_by_id["{0.0.1.00000000}.{mic-ignored}"].effective_target_volume,
+        None
+    );
+    assert!(
+        (active_by_id["{0.0.1.00000000}.{mic-ignored}"].current_volume_scalar - 0.25).abs() < 1e-6
+    );
+}
+
+#[test]
+fn forgetting_disconnected_microphone_deletes_it_from_state_and_config_so_replug_follows_default_volume() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 70
+
+[microphones."{0.0.1.00000000}.{mic-active}"]
+friendly_name = "Desk Mic"
+policy = "custom"
+target_volume = 60
+
+[microphones."{0.0.1.00000000}.{mic-old-custom}"]
+friendly_name = "Old USB Mic"
+policy = "custom"
+target_volume = 35
+
+[microphones."{0.0.1.00000000}.{mic-old-ignored}"]
+friendly_name = "Old Virtual Cable"
+policy = "ignored"
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-active}".to_string(),
+        friendly_name: "Desk Mic".to_string(),
+        volume_scalar: 0.60,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    // Forget the disconnected custom Microphone.
+    controller
+        .handle_command(AppCommand::ForgetMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-old-custom}".to_string(),
+        })
+        .unwrap();
+
+    // Removed from disconnected snapshot, other disconnected entry preserved.
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.disconnected_microphones.len(), 1);
+    assert_eq!(
+        snapshot.disconnected_microphones[0].endpoint_id,
+        "{0.0.1.00000000}.{mic-old-ignored}"
+    );
+
+    // Permanently removed from config.toml on disk.
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!saved_toml.contains("{0.0.1.00000000}.{mic-old-custom}"));
+    assert!(!saved_toml.contains("Old USB Mic"));
+    assert!(saved_toml.contains("{0.0.1.00000000}.{mic-old-ignored}"));
+    assert!(saved_toml.contains("{0.0.1.00000000}.{mic-active}"));
+
+    // Reloading from disk confirms the forgotten Microphone stays gone.
+    let reload_backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-active}".to_string(),
+        friendly_name: "Desk Mic".to_string(),
+        volume_scalar: 0.60,
+    }]);
+    let mut reloaded = AppController::start(reload_backend.clone(), config_path.clone()).unwrap();
+    assert_eq!(reloaded.snapshot().disconnected_microphones.len(), 1);
+    assert_eq!(
+        reloaded.snapshot().disconnected_microphones[0].endpoint_id,
+        "{0.0.1.00000000}.{mic-old-ignored}"
+    );
+
+    // Replugging the forgotten Microphone later treats it as newly discovered (FollowDefault -> 70%).
+    let replugged = ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-old-custom}".to_string(),
+        friendly_name: "Old USB Mic".to_string(),
+        volume_scalar: 0.20,
+    };
+    reload_backend.add_microphone(replugged.clone());
+    reloaded
+        .handle_event(AudioEvent::MicrophoneConnected(replugged))
+        .unwrap();
+
+    assert_eq!(
+        reload_backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-old-custom}".to_string(), 0.70)]
+    );
+    let after_replug = reloaded.snapshot();
+    let by_id = microphones_by_id(&after_replug);
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-old-custom}"].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-old-custom}"].effective_target_volume,
+        Some(70)
+    );
+}
+
+#[test]
+fn forgetting_active_or_unknown_microphone_is_noop() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 80
+
+[microphones."{0.0.1.00000000}.{mic-active}"]
+friendly_name = "Blue Yeti"
+policy = "custom"
+target_volume = 50
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-active}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.50,
+    }]);
+
+    let mut controller = AppController::start(backend, config_path.clone()).unwrap();
+
+    // Attempting to forget an active Microphone does not remove its saved Lock Policy.
+    controller
+        .handle_command(AppCommand::ForgetMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-active}".to_string(),
+        })
+        .unwrap();
+
+    // Attempting to forget an unknown Endpoint ID is a clean no-op.
+    controller
+        .handle_command(AppCommand::ForgetMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{does-not-exist}".to_string(),
+        })
+        .unwrap();
+
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.active_microphones.len(), 1);
+    assert_eq!(
+        snapshot.active_microphones[0].lock_policy,
+        LockPolicy::Custom(50)
+    );
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_toml.contains("{0.0.1.00000000}.{mic-active}"));
+    assert!(saved_toml.contains("target_volume = 50"));
 }

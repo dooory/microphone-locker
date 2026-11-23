@@ -32,11 +32,22 @@ pub struct MicrophoneSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectedMicrophoneSnapshot {
+    pub endpoint_id: String,
+    pub friendly_name: String,
+    pub lock_policy: LockPolicy,
+    pub effective_target_volume: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     SetDefaultVolume(u8),
     SetMicrophoneLockPolicy {
         endpoint_id: String,
         lock_policy: LockPolicy,
+    },
+    ForgetMicrophone {
+        endpoint_id: String,
     },
     SetPaused(bool),
     SetStartWithWindows(bool),
@@ -48,6 +59,7 @@ pub struct AppSnapshot {
     pub paused: bool,
     pub start_with_windows: bool,
     pub active_microphones: Vec<MicrophoneSnapshot>,
+    pub disconnected_microphones: Vec<DisconnectedMicrophoneSnapshot>,
 }
 
 pub struct AppController<B: AudioBackend, S: StartupRegistry = NoopStartupRegistry> {
@@ -168,6 +180,14 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                     mic.volume_scalar = enforced_scalar;
                 }
             }
+            AppCommand::ForgetMicrophone { endpoint_id } => {
+                if self.active_microphones.contains_key(&endpoint_id) {
+                    return Ok(());
+                }
+                if self.config.microphones.remove(&endpoint_id).is_some() {
+                    save_config(&self.config_path, &self.config)?;
+                }
+            }
             AppCommand::SetPaused(paused) => {
                 if self.paused == paused {
                     return Ok(());
@@ -278,11 +298,27 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
             })
             .collect();
 
+        let disconnected_microphones = self
+            .config
+            .microphones
+            .iter()
+            .filter(|(endpoint_id, _)| !self.active_microphones.contains_key(*endpoint_id))
+            .map(|(endpoint_id, entry)| DisconnectedMicrophoneSnapshot {
+                endpoint_id: endpoint_id.clone(),
+                friendly_name: entry.friendly_name.clone(),
+                lock_policy: entry.lock_policy,
+                effective_target_volume: entry
+                    .lock_policy
+                    .resolve_target_volume(self.config.default_volume),
+            })
+            .collect();
+
         AppSnapshot {
             default_volume: self.config.default_volume,
             paused: self.paused,
             start_with_windows: self.start_with_windows,
             active_microphones,
+            disconnected_microphones,
         }
     }
 
