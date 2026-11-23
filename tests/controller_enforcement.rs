@@ -1086,3 +1086,343 @@ fn setting_lock_policy_for_unknown_or_unchanged_microphone_is_noop() {
         .unwrap();
     assert!(backend.set_calls().is_empty());
 }
+
+#[test]
+fn pausing_suspends_enforcement_preserves_lock_policies_and_still_tracks_devices() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 80
+
+[microphones."{0.0.1.00000000}.{mic-follow}"]
+friendly_name = "Blue Yeti"
+policy = "follow_default"
+
+[microphones."{0.0.1.00000000}.{mic-custom}"]
+friendly_name = "Shure SM7B"
+policy = "custom"
+target_volume = 55
+
+[microphones."{0.0.1.00000000}.{mic-ignored}"]
+friendly_name = "Virtual Cable"
+policy = "ignored"
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-follow}".to_string(),
+            friendly_name: "Blue Yeti".to_string(),
+            volume_scalar: 0.80,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-custom}".to_string(),
+            friendly_name: "Shure SM7B".to_string(),
+            volume_scalar: 0.55,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-ignored}".to_string(),
+            friendly_name: "Virtual Cable".to_string(),
+            volume_scalar: 0.30,
+        },
+    ]);
+
+    let mut controller = AppController::start(backend.clone(), config_path).unwrap();
+    backend.clear_set_calls();
+
+    assert!(!controller.snapshot().paused);
+
+    controller
+        .handle_command(AppCommand::SetPaused(true))
+        .unwrap();
+    assert!(controller.snapshot().paused);
+
+    // External volume changes on locked Microphones must not be reverted while Paused.
+    controller
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-follow}".to_string(),
+            volume_scalar: 0.25,
+        })
+        .unwrap();
+    controller
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-custom}".to_string(),
+            volume_scalar: 0.90,
+        })
+        .unwrap();
+
+    // Newly connected Microphone is tracked & registered without enforcing volume while Paused.
+    let new_mic = ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-new}".to_string(),
+        friendly_name: "Headset Mic".to_string(),
+        volume_scalar: 0.40,
+    };
+    backend.add_microphone(new_mic.clone());
+    controller
+        .handle_event(AudioEvent::MicrophoneConnected(new_mic))
+        .unwrap();
+
+    // Disconnecting a Microphone still updates the active list while Paused.
+    backend.remove_microphone("{0.0.1.00000000}.{mic-ignored}");
+    controller
+        .handle_event(AudioEvent::MicrophoneDisconnected {
+            endpoint_id: "{0.0.1.00000000}.{mic-ignored}".to_string(),
+        })
+        .unwrap();
+
+    assert!(backend.set_calls().is_empty());
+
+    let snapshot = controller.snapshot();
+    assert!(snapshot.paused);
+    assert_eq!(snapshot.active_microphones.len(), 3);
+
+    let by_id = microphones_by_id(&snapshot);
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-follow}"].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-follow}"].effective_target_volume,
+        Some(80)
+    );
+    assert!((by_id["{0.0.1.00000000}.{mic-follow}"].current_volume_scalar - 0.25).abs() < 1e-6);
+
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-custom}"].lock_policy,
+        LockPolicy::Custom(55)
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-custom}"].effective_target_volume,
+        Some(55)
+    );
+    assert!((by_id["{0.0.1.00000000}.{mic-custom}"].current_volume_scalar - 0.90).abs() < 1e-6);
+
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-new}"].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert!((by_id["{0.0.1.00000000}.{mic-new}"].current_volume_scalar - 0.40).abs() < 1e-6);
+}
+
+#[test]
+fn resuming_from_paused_immediately_reconciles_active_locked_microphones_and_leaves_ignored_untouched() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 80
+
+[microphones."{0.0.1.00000000}.{mic-a-follow}"]
+friendly_name = "Blue Yeti"
+policy = "follow_default"
+
+[microphones."{0.0.1.00000000}.{mic-b-custom}"]
+friendly_name = "Shure SM7B"
+policy = "custom"
+target_volume = 55
+
+[microphones."{0.0.1.00000000}.{mic-c-on-target}"]
+friendly_name = "Desk Mic"
+policy = "follow_default"
+
+[microphones."{0.0.1.00000000}.{mic-d-ignored}"]
+friendly_name = "Virtual Cable"
+policy = "ignored"
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-a-follow}".to_string(),
+            friendly_name: "Blue Yeti".to_string(),
+            volume_scalar: 0.80,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-b-custom}".to_string(),
+            friendly_name: "Shure SM7B".to_string(),
+            volume_scalar: 0.55,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-c-on-target}".to_string(),
+            friendly_name: "Desk Mic".to_string(),
+            volume_scalar: 0.80,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-d-ignored}".to_string(),
+            friendly_name: "Virtual Cable".to_string(),
+            volume_scalar: 0.30,
+        },
+    ]);
+
+    let mut controller = AppController::start(backend.clone(), config_path).unwrap();
+    backend.clear_set_calls();
+
+    controller
+        .handle_command(AppCommand::SetPaused(true))
+        .unwrap();
+
+    // Drift volumes and connect a new Microphone while Paused.
+    controller
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-a-follow}".to_string(),
+            volume_scalar: 0.20,
+        })
+        .unwrap();
+    controller
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-b-custom}".to_string(),
+            volume_scalar: 0.95,
+        })
+        .unwrap();
+    controller
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-d-ignored}".to_string(),
+            volume_scalar: 0.70,
+        })
+        .unwrap();
+
+    let new_mic = ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-e-new}".to_string(),
+        friendly_name: "Headset Mic".to_string(),
+        volume_scalar: 0.10,
+    };
+    backend.add_microphone(new_mic.clone());
+    controller
+        .handle_event(AudioEvent::MicrophoneConnected(new_mic))
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+
+    // Resuming immediately reconciles all drifted active locked Microphones.
+    controller
+        .handle_command(AppCommand::SetPaused(false))
+        .unwrap();
+
+    assert!(!controller.snapshot().paused);
+    assert_eq!(
+        backend.set_calls(),
+        vec![
+            ("{0.0.1.00000000}.{mic-a-follow}".to_string(), 0.80),
+            ("{0.0.1.00000000}.{mic-b-custom}".to_string(), 0.55),
+            ("{0.0.1.00000000}.{mic-e-new}".to_string(), 0.80),
+        ]
+    );
+
+    let snapshot = controller.snapshot();
+    let by_id = microphones_by_id(&snapshot);
+    assert!((by_id["{0.0.1.00000000}.{mic-a-follow}"].current_volume_scalar - 0.80).abs() < 1e-6);
+    assert!((by_id["{0.0.1.00000000}.{mic-b-custom}"].current_volume_scalar - 0.55).abs() < 1e-6);
+    assert!((by_id["{0.0.1.00000000}.{mic-d-ignored}"].current_volume_scalar - 0.70).abs() < 1e-6);
+    assert!((by_id["{0.0.1.00000000}.{mic-e-new}"].current_volume_scalar - 0.80).abs() < 1e-6);
+
+    // Subsequent external drift reverts immediately again.
+    backend.clear_set_calls();
+    controller
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-a-follow}".to_string(),
+            volume_scalar: 0.35,
+        })
+        .unwrap();
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a-follow}".to_string(), 0.80)]
+    );
+}
+
+#[test]
+fn paused_state_is_never_persisted_to_config_and_resets_to_active_on_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.80,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    controller
+        .handle_command(AppCommand::SetPaused(true))
+        .unwrap();
+    assert!(controller.snapshot().paused);
+
+    // Updating Default Volume while Paused persists config without enforcing audio volume.
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(65))
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_toml.contains("default_volume = 65"));
+    assert!(
+        !saved_toml.contains("paused"),
+        "Paused must never be persisted to config.toml"
+    );
+
+    // Restarting while previously Paused always resumes active enforcement and reconciles.
+    let restart_backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.25,
+    }]);
+    let restarted = AppController::start(restart_backend.clone(), config_path).unwrap();
+
+    assert!(!restarted.snapshot().paused);
+    assert_eq!(restarted.snapshot().default_volume, 65);
+    assert_eq!(
+        restart_backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.65)]
+    );
+}
+
+#[test]
+fn setting_microphone_lock_policy_while_paused_persists_without_enforcing_until_resumed() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.80,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    controller
+        .handle_command(AppCommand::SetPaused(true))
+        .unwrap();
+
+    // Updating LockPolicy while Paused persists to config without enforcing audio volume.
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            lock_policy: LockPolicy::Custom(45),
+        })
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+    assert_eq!(
+        controller.snapshot().active_microphones[0].lock_policy,
+        LockPolicy::Custom(45)
+    );
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_toml.contains("policy = \"custom\""));
+    assert!(saved_toml.contains("target_volume = 45"));
+
+    // Resuming immediately enforces the new Custom Target Volume.
+    controller
+        .handle_command(AppCommand::SetPaused(false))
+        .unwrap();
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.45)]
+    );
+}
