@@ -7,14 +7,18 @@ use eframe::egui;
 
 use crate::audio::AudioBackend;
 use crate::config::LockPolicy;
-use crate::controller::{AppCommand, AppController, AppSnapshot, MicrophoneSnapshot};
+use crate::controller::{
+    AppCommand, AppController, AppSnapshot, DisconnectedMicrophoneSnapshot, MicrophoneSnapshot,
+};
+use crate::startup::StartupRegistry;
 use crate::tray::{SystemTray, TrayAction, window_icon_data};
 
 /// Runs the native Windows system tray + `egui` settings window event loop.
-pub fn run_app<B: AudioBackend + 'static>(
-    controller: Arc<Mutex<AppController<B>>>,
+pub fn run_app<B: AudioBackend + 'static, S: StartupRegistry + 'static>(
+    controller: Arc<Mutex<AppController<B, S>>>,
     open_window_on_startup: bool,
     egui_ctx_slot: Arc<OnceLock<egui::Context>>,
+    show_window_rx: Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let viewport = egui::ViewportBuilder::default()
         .with_title("Microphone Locker")
@@ -37,8 +41,9 @@ pub fn run_app<B: AudioBackend + 'static>(
             let (tray, tray_rx) = SystemTray::build(cc.egui_ctx.clone())?;
             Ok(Box::new(SettingsApp {
                 controller,
-                _tray: tray,
+                tray,
                 tray_rx,
+                show_window_rx,
                 hide_on_first_frame: !open_window_on_startup,
                 quitting: false,
                 last_error: None,
@@ -49,16 +54,17 @@ pub fn run_app<B: AudioBackend + 'static>(
     Ok(())
 }
 
-struct SettingsApp<B: AudioBackend> {
-    controller: Arc<Mutex<AppController<B>>>,
-    _tray: SystemTray,
+struct SettingsApp<B: AudioBackend, S: StartupRegistry> {
+    controller: Arc<Mutex<AppController<B, S>>>,
+    tray: SystemTray,
     tray_rx: Receiver<TrayAction>,
+    show_window_rx: Receiver<()>,
     hide_on_first_frame: bool,
     quitting: bool,
     last_error: Option<String>,
 }
 
-impl<B: AudioBackend> SettingsApp<B> {
+impl<B: AudioBackend, S: StartupRegistry> SettingsApp<B, S> {
     fn snapshot(&self) -> Option<AppSnapshot> {
         self.controller.lock().ok().map(|ctrl| ctrl.snapshot())
     }
@@ -75,13 +81,29 @@ impl<B: AudioBackend> SettingsApp<B> {
         }
     }
 
+    fn send_command_and_refresh(&mut self, command: AppCommand, snapshot: &mut AppSnapshot) {
+        self.send_command(command);
+        if let Some(updated) = self.snapshot() {
+            *snapshot = updated;
+        }
+    }
+
+    fn show_and_focus_window(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
     fn drain_tray_actions(&mut self, ctx: &egui::Context) {
         while let Ok(action) = self.tray_rx.try_recv() {
             match action {
                 TrayAction::ShowWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    Self::show_and_focus_window(ctx);
+                }
+                TrayAction::TogglePaused => {
+                    if let Some(snapshot) = self.snapshot() {
+                        self.send_command(AppCommand::SetPaused(!snapshot.paused));
+                    }
                 }
                 TrayAction::Quit => {
                     self.quitting = true;
@@ -90,9 +112,19 @@ impl<B: AudioBackend> SettingsApp<B> {
             }
         }
     }
+
+    fn drain_show_window_signals(&mut self, ctx: &egui::Context) {
+        let mut requested = false;
+        while self.show_window_rx.try_recv().is_ok() {
+            requested = true;
+        }
+        if requested {
+            Self::show_and_focus_window(ctx);
+        }
+    }
 }
 
-impl<B: AudioBackend> eframe::App for SettingsApp<B> {
+impl<B: AudioBackend, S: StartupRegistry> eframe::App for SettingsApp<B, S> {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.hide_on_first_frame {
             self.hide_on_first_frame = false;
@@ -100,6 +132,11 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
         }
 
         self.drain_tray_actions(ctx);
+        self.drain_show_window_signals(ctx);
+
+        if let Some(snapshot) = self.snapshot() {
+            self.tray.sync_paused(snapshot.paused);
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -138,6 +175,57 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
                 return;
             };
 
+            // Global temporary Paused toggle.
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        if snapshot.paused {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 155, 45),
+                                egui::RichText::new("Paused").strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Volume enforcement is temporarily suspended; Lock Policies are preserved.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(65, 175, 140),
+                                egui::RichText::new("Active").strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Enforcing Target Volumes on all locked Microphones.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let button_label = if snapshot.paused {
+                            "Resume Locking"
+                        } else {
+                            "Pause Locking"
+                        };
+                        if ui.button(button_label).clicked() {
+                            self.send_command_and_refresh(
+                                AppCommand::SetPaused(!snapshot.paused),
+                                &mut snapshot,
+                            );
+                            self.tray.sync_paused(snapshot.paused);
+                        }
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+
             // Global Default Volume control.
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -157,12 +245,25 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
                     .integer();
                 ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(120.0);
                 if ui.add(slider).changed() && default_volume != snapshot.default_volume {
-                    self.send_command(AppCommand::SetDefaultVolume(default_volume));
-                    if let Some(updated) = self.snapshot() {
-                        snapshot = updated;
-                    }
+                    self.send_command_and_refresh(
+                        AppCommand::SetDefaultVolume(default_volume),
+                        &mut snapshot,
+                    );
                 }
             });
+
+            ui.add_space(8.0);
+            let mut start_with_windows = snapshot.start_with_windows;
+            if ui
+                .checkbox(&mut start_with_windows, "Start with Windows")
+                .changed()
+                && start_with_windows != snapshot.start_with_windows
+            {
+                self.send_command_and_refresh(
+                    AppCommand::SetStartWithWindows(start_with_windows),
+                    &mut snapshot,
+                );
+            }
 
             ui.add_space(12.0);
             ui.strong(format!(
@@ -174,6 +275,8 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
             let footer_height = 24.0;
             let list_height = (ui.available_height() - footer_height).max(80.0);
 
+            let mut pending_commands = Vec::new();
+
             egui::ScrollArea::vertical()
                 .max_height(list_height)
                 .auto_shrink([false, false])
@@ -184,11 +287,41 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
                         );
                     } else {
                         for mic in &snapshot.active_microphones {
-                            render_microphone_row(ui, mic);
+                            if let Some(cmd) =
+                                render_microphone_row(ui, mic, snapshot.default_volume)
+                            {
+                                pending_commands.push(cmd);
+                            }
                             ui.add_space(6.0);
                         }
                     }
+
+                    if !snapshot.disconnected_microphones.is_empty() {
+                        ui.add_space(10.0);
+                        egui::CollapsingHeader::new(format!(
+                            "Disconnected Microphones ({})",
+                            snapshot.disconnected_microphones.len()
+                        ))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            for mic in &snapshot.disconnected_microphones {
+                                if let Some(cmd) = render_disconnected_microphone_row(
+                                    ui,
+                                    mic,
+                                    snapshot.default_volume,
+                                ) {
+                                    pending_commands.push(cmd);
+                                }
+                                ui.add_space(6.0);
+                            }
+                        });
+                    }
                 });
+
+            for cmd in pending_commands {
+                self.send_command(cmd);
+            }
 
             ui.add_space(4.0);
             ui.label(
@@ -202,42 +335,112 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
     }
 }
 
-fn render_microphone_row(ui: &mut egui::Ui, mic: &MicrophoneSnapshot) {
+fn render_microphone_row(
+    ui: &mut egui::Ui,
+    mic: &MicrophoneSnapshot,
+    default_volume: u8,
+) -> Option<AppCommand> {
     let current_percent = (mic.current_volume_scalar.clamp(0.0, 1.0) * 100.0).round() as u8;
+    let is_ignored = mic.lock_policy == LockPolicy::Ignored;
+    let is_custom = matches!(mic.lock_policy, LockPolicy::Custom(_));
+    let mut command = None;
 
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.strong(&mic.friendly_name);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let target_label = match mic.effective_target_volume {
-                    Some(target) => format!("Target: {target}%"),
-                    None => "Ignored".to_string(),
-                };
-                ui.strong(target_label);
+    ui.push_id(&mic.endpoint_id, |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.strong(&mic.friendly_name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut ignored = is_ignored;
+                    if ui.checkbox(&mut ignored, "Ignored").changed() {
+                        command = Some(AppCommand::SetMicrophoneIgnored {
+                            endpoint_id: mic.endpoint_id.clone(),
+                            ignored,
+                        });
+                    }
+                });
+            });
+
+            ui.horizontal(|ui| {
+                let policy_text = format_lock_policy_label(mic.lock_policy, default_volume);
+                ui.label(egui::RichText::new(policy_text).small().weak());
+
+                if is_custom && ui.small_button("Reset to Default").clicked() {
+                    command = Some(AppCommand::SetMicrophoneLockPolicy {
+                        endpoint_id: mic.endpoint_id.clone(),
+                        lock_policy: LockPolicy::FollowDefault,
+                    });
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Current: {current_percent}%"))
+                            .small()
+                            .weak(),
+                    );
+                });
+            });
+
+            ui.add_space(4.0);
+
+            let displayed_target = mic.effective_target_volume.unwrap_or(current_percent);
+            let mut slider_value = displayed_target;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Target Volume").small());
+                ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(120.0);
+                let slider = egui::Slider::new(&mut slider_value, 0..=100)
+                    .suffix("%")
+                    .integer();
+                if ui.add_enabled(!is_ignored, slider).changed()
+                    && slider_value != displayed_target
+                {
+                    command = Some(AppCommand::SetMicrophoneLockPolicy {
+                        endpoint_id: mic.endpoint_id.clone(),
+                        lock_policy: LockPolicy::Custom(slider_value),
+                    });
+                }
             });
         });
-
-        ui.horizontal(|ui| {
-            let policy_text = match mic.lock_policy {
-                LockPolicy::FollowDefault => "Following Default",
-                LockPolicy::Custom(_) => "Custom Target Volume",
-                LockPolicy::Ignored => "Ignored (not enforced)",
-            };
-            ui.label(egui::RichText::new(policy_text).small().weak());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(format!("Current: {current_percent}%"))
-                        .small()
-                        .weak(),
-                );
-            });
-        });
-
-        ui.add_space(4.0);
-        ui.add(
-            egui::ProgressBar::new(mic.current_volume_scalar.clamp(0.0, 1.0))
-                .desired_height(6.0),
-        );
     });
+
+    command
+}
+
+fn render_disconnected_microphone_row(
+    ui: &mut egui::Ui,
+    mic: &DisconnectedMicrophoneSnapshot,
+    default_volume: u8,
+) -> Option<AppCommand> {
+    let mut command = None;
+
+    ui.push_id(("disconnected", &mic.endpoint_id), |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.strong(&mic.friendly_name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Forget").clicked() {
+                        command = Some(AppCommand::ForgetMicrophone {
+                            endpoint_id: mic.endpoint_id.clone(),
+                        });
+                    }
+                });
+            });
+
+            let policy_text = format_lock_policy_label(mic.lock_policy, default_volume);
+            ui.label(egui::RichText::new(policy_text).small().weak());
+        });
+    });
+
+    command
+}
+
+fn format_lock_policy_label(lock_policy: LockPolicy, default_volume: u8) -> String {
+    match lock_policy {
+        LockPolicy::FollowDefault => format!("Following Default ({default_volume}%)"),
+        LockPolicy::Custom(target) => format!("Custom Target Volume ({target}%)"),
+        LockPolicy::Ignored => "Ignored (not enforced)".to_string(),
+    }
 }

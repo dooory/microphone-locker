@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::audio::{ActiveMicrophone, AudioBackend, AudioError, AudioEvent};
 use crate::config::{AppConfig, ConfigError, LockPolicy, MicrophoneConfig, load_config, save_config};
+use crate::startup::{NoopStartupRegistry, StartupError, StartupRegistry};
 
 /// Sub-0.5% scalar tolerance to avoid revert loops from audio driver quantization.
 pub const VOLUME_TOLERANCE: f32 = 0.005;
@@ -17,6 +18,8 @@ pub enum ControllerError {
     Audio(#[from] AudioError),
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    Startup(#[from] StartupError),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,46 +32,83 @@ pub struct MicrophoneSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectedMicrophoneSnapshot {
+    pub endpoint_id: String,
+    pub friendly_name: String,
+    pub lock_policy: LockPolicy,
+    pub effective_target_volume: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     SetDefaultVolume(u8),
+    SetMicrophoneLockPolicy {
+        endpoint_id: String,
+        lock_policy: LockPolicy,
+    },
+    SetMicrophoneIgnored {
+        endpoint_id: String,
+        ignored: bool,
+    },
+    ForgetMicrophone {
+        endpoint_id: String,
+    },
+    SetPaused(bool),
+    SetStartWithWindows(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppSnapshot {
     pub default_volume: u8,
+    pub paused: bool,
+    pub start_with_windows: bool,
     pub active_microphones: Vec<MicrophoneSnapshot>,
+    pub disconnected_microphones: Vec<DisconnectedMicrophoneSnapshot>,
 }
 
-pub struct AppController<B: AudioBackend> {
+pub struct AppController<B: AudioBackend, S: StartupRegistry = NoopStartupRegistry> {
     backend: B,
+    startup: S,
     config_path: PathBuf,
     config: AppConfig,
+    paused: bool,
     active_microphones: BTreeMap<String, ActiveMicrophone>,
     open_window_on_startup: bool,
+    start_with_windows: bool,
 }
 
-impl<B: AudioBackend> AppController<B> {
+impl<B: AudioBackend> AppController<B, NoopStartupRegistry> {
     pub fn start(backend: B, config_path: PathBuf) -> Result<Self, ControllerError> {
+        Self::start_with_startup(backend, NoopStartupRegistry, config_path)
+    }
+}
+
+impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
+    pub fn start_with_startup(
+        backend: B,
+        startup: S,
+        config_path: PathBuf,
+    ) -> Result<Self, ControllerError> {
         let (config, open_window_on_startup) = match load_config(&config_path)? {
             Some(existing) => (existing, false),
             None => (AppConfig::initial_default(), true),
         };
+        let start_with_windows = startup.is_enabled()?;
 
         let mut controller = Self {
             backend,
+            startup,
             config_path,
             config,
+            paused: false,
             active_microphones: BTreeMap::new(),
             open_window_on_startup,
+            start_with_windows,
         };
 
-        let active = controller.backend.list_active_microphones()?;
         let mut config_dirty = open_window_on_startup;
-
-        for mic in active {
-            if controller.activate_microphone(mic)? {
-                config_dirty = true;
-            }
+        if controller.reconcile_active_microphones()? {
+            config_dirty = true;
         }
 
         if config_dirty {
@@ -92,26 +132,101 @@ impl<B: AudioBackend> AppController<B> {
                 self.config.default_volume = clamped;
                 save_config(&self.config_path, &self.config)?;
 
-                let follow_default_mics: Vec<(String, f32)> = self
+                let follow_default_ids: Vec<String> = self
                     .active_microphones
-                    .values()
-                    .filter(|mic| {
+                    .keys()
+                    .filter(|endpoint_id| {
                         self.config
                             .microphones
-                            .get(&mic.endpoint_id)
+                            .get(*endpoint_id)
                             .is_some_and(|entry| entry.lock_policy == LockPolicy::FollowDefault)
                     })
-                    .map(|mic| (mic.endpoint_id.clone(), mic.volume_scalar))
+                    .cloned()
                     .collect();
 
-                for (endpoint_id, current_scalar) in follow_default_mics {
-                    if let Some(enforced_scalar) =
-                        self.enforce_if_needed(&endpoint_id, current_scalar)?
-                        && let Some(mic) = self.active_microphones.get_mut(&endpoint_id)
-                    {
-                        mic.volume_scalar = enforced_scalar;
-                    }
+                for endpoint_id in follow_default_ids {
+                    self.enforce_active_microphone(&endpoint_id)?;
                 }
+            }
+            AppCommand::SetMicrophoneLockPolicy {
+                endpoint_id,
+                lock_policy,
+            } => {
+                let normalized_policy = match lock_policy {
+                    LockPolicy::Custom(target) => LockPolicy::Custom(target.min(100)),
+                    other => other,
+                };
+
+                let Some(entry) = self.config.microphones.get_mut(&endpoint_id) else {
+                    return Ok(());
+                };
+
+                if entry.lock_policy == normalized_policy {
+                    return Ok(());
+                }
+
+                entry.previous_custom_target_volume = match (entry.lock_policy, normalized_policy) {
+                    (LockPolicy::Custom(previous), LockPolicy::Ignored) => Some(previous.min(100)),
+                    _ => None,
+                };
+                entry.lock_policy = normalized_policy;
+                save_config(&self.config_path, &self.config)?;
+
+                self.enforce_active_microphone(&endpoint_id)?;
+            }
+            AppCommand::SetMicrophoneIgnored {
+                endpoint_id,
+                ignored,
+            } => {
+                let Some(entry) = self.config.microphones.get_mut(&endpoint_id) else {
+                    return Ok(());
+                };
+
+                if ignored {
+                    if entry.lock_policy == LockPolicy::Ignored {
+                        return Ok(());
+                    }
+                    entry.previous_custom_target_volume = match entry.lock_policy {
+                        LockPolicy::Custom(previous) => Some(previous.min(100)),
+                        _ => None,
+                    };
+                    entry.lock_policy = LockPolicy::Ignored;
+                } else {
+                    if entry.lock_policy != LockPolicy::Ignored {
+                        return Ok(());
+                    }
+                    entry.lock_policy = match entry.previous_custom_target_volume.take() {
+                        Some(target) => LockPolicy::Custom(target.min(100)),
+                        None => LockPolicy::FollowDefault,
+                    };
+                }
+
+                save_config(&self.config_path, &self.config)?;
+                self.enforce_active_microphone(&endpoint_id)?;
+            }
+            AppCommand::ForgetMicrophone { endpoint_id } => {
+                if self.active_microphones.contains_key(&endpoint_id) {
+                    return Ok(());
+                }
+                if self.config.microphones.remove(&endpoint_id).is_some() {
+                    save_config(&self.config_path, &self.config)?;
+                }
+            }
+            AppCommand::SetPaused(paused) => {
+                if self.paused == paused {
+                    return Ok(());
+                }
+                self.paused = paused;
+                if !self.paused && self.reconcile_active_microphones()? {
+                    save_config(&self.config_path, &self.config)?;
+                }
+            }
+            AppCommand::SetStartWithWindows(enabled) => {
+                if self.start_with_windows == enabled {
+                    return Ok(());
+                }
+                self.startup.set_enabled(enabled)?;
+                self.start_with_windows = enabled;
             }
         }
         Ok(())
@@ -162,6 +277,11 @@ impl<B: AudioBackend> AppController<B> {
                     save_config(&self.config_path, &self.config)?;
                 }
             }
+            AudioEvent::SystemWake => {
+                if self.reconcile_active_microphones()? {
+                    save_config(&self.config_path, &self.config)?;
+                }
+            }
         }
         Ok(())
     }
@@ -189,10 +309,42 @@ impl<B: AudioBackend> AppController<B> {
             })
             .collect();
 
+        let disconnected_microphones = self
+            .config
+            .microphones
+            .iter()
+            .filter(|(endpoint_id, _)| !self.active_microphones.contains_key(*endpoint_id))
+            .map(|(endpoint_id, entry)| DisconnectedMicrophoneSnapshot {
+                endpoint_id: endpoint_id.clone(),
+                friendly_name: entry.friendly_name.clone(),
+                lock_policy: entry.lock_policy,
+                effective_target_volume: entry
+                    .lock_policy
+                    .resolve_target_volume(self.config.default_volume),
+            })
+            .collect();
+
         AppSnapshot {
             default_volume: self.config.default_volume,
+            paused: self.paused,
+            start_with_windows: self.start_with_windows,
             active_microphones,
+            disconnected_microphones,
         }
+    }
+
+    fn reconcile_active_microphones(&mut self) -> Result<bool, AudioError> {
+        let active = self.backend.list_active_microphones()?;
+        self.active_microphones.clear();
+
+        let mut config_dirty = false;
+        for mic in active {
+            if self.activate_microphone(mic)? {
+                config_dirty = true;
+            }
+        }
+
+        Ok(config_dirty)
     }
 
     fn activate_microphone(&mut self, mut mic: ActiveMicrophone) -> Result<bool, AudioError> {
@@ -223,6 +375,7 @@ impl<B: AudioBackend> AppController<B> {
                     MicrophoneConfig {
                         friendly_name: friendly_name.to_string(),
                         lock_policy: LockPolicy::FollowDefault,
+                        previous_custom_target_volume: None,
                     },
                 );
                 true
@@ -230,11 +383,28 @@ impl<B: AudioBackend> AppController<B> {
         }
     }
 
+    fn enforce_active_microphone(&mut self, endpoint_id: &str) -> Result<(), ControllerError> {
+        if let Some(current_scalar) = self
+            .active_microphones
+            .get(endpoint_id)
+            .map(|mic| mic.volume_scalar)
+            && let Some(enforced_scalar) =
+                self.enforce_if_needed(endpoint_id, current_scalar)?
+            && let Some(mic) = self.active_microphones.get_mut(endpoint_id)
+        {
+            mic.volume_scalar = enforced_scalar;
+        }
+        Ok(())
+    }
+
     fn enforce_if_needed(
         &self,
         endpoint_id: &str,
         actual_scalar: f32,
     ) -> Result<Option<f32>, AudioError> {
+        if self.paused {
+            return Ok(None);
+        }
         let Some(entry) = self.config.microphones.get(endpoint_id) else {
             return Ok(None);
         };
