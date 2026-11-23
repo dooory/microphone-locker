@@ -142,67 +142,45 @@ pub fn window_icon_data() -> egui::IconData {
 
 /// Generates a crisp 32x32 RGBA microphone badge icon in pure Rust.
 pub fn render_microphone_icon_rgba() -> Vec<u8> {
-    let size = ICON_SIZE as usize;
-    let mut rgba = vec![0u8; size * size * 4];
-    let center = (ICON_SIZE as f32 - 1.0) * 0.5;
+    render_badge_icon_rgba([28.0, 110.0, 140.0], |p, center| {
+        // White microphone silhouette: capsule, U-cradle, stem, and base.
+        let capsule_dist = segment_distance(p, [center, 9.5], [center, 14.5]) - 3.3;
 
-    for y in 0..size {
-        for x in 0..size {
-            let px = x as f32;
-            let py = y as f32;
+        let arc_dx = p[0] - center;
+        let arc_dy = p[1] - 14.5;
+        let arc_dist = if arc_dy >= 0.0 {
+            (arc_dx.hypot(arc_dy) - 6.0).abs() - 1.15
+        } else {
+            let left_tip = (p[0] - (center - 6.0)).hypot(p[1] - 14.5) - 1.15;
+            let right_tip = (p[0] - (center + 6.0)).hypot(p[1] - 14.5) - 1.15;
+            left_tip.min(right_tip)
+        };
 
-            let p = [px, py];
+        let stem_dist = segment_distance(p, [center, 20.5], [center, 24.4]) - 1.05;
+        let base_dist = segment_distance(p, [center - 3.8, 24.6], [center + 3.8, 24.6]) - 1.05;
 
-            // Circular badge background (visible on both light and dark Windows taskbars).
-            let bg_dist = ((px - center).hypot(py - center)) - 14.8;
-            let bg_alpha = (0.5 - bg_dist).clamp(0.0, 1.0);
-
-            // White microphone silhouette: capsule, U-cradle, stem, and base.
-            let capsule_dist = segment_distance(p, [center, 9.5], [center, 14.5]) - 3.3;
-
-            let arc_dx = px - center;
-            let arc_dy = py - 14.5;
-            let arc_dist = if arc_dy >= 0.0 {
-                (arc_dx.hypot(arc_dy) - 6.0).abs() - 1.15
-            } else {
-                let left_tip = (px - (center - 6.0)).hypot(py - 14.5) - 1.15;
-                let right_tip = (px - (center + 6.0)).hypot(py - 14.5) - 1.15;
-                left_tip.min(right_tip)
-            };
-
-            let stem_dist = segment_distance(p, [center, 20.5], [center, 24.4]) - 1.05;
-            let base_dist =
-                segment_distance(p, [center - 3.8, 24.6], [center + 3.8, 24.6]) - 1.05;
-
-            let fg_dist = capsule_dist.min(arc_dist).min(stem_dist).min(base_dist);
-            let fg_alpha = (0.5 - fg_dist).clamp(0.0, 1.0);
-
-            // Composite white foreground over teal-blue badge.
-            let bg_r = 28.0_f32;
-            let bg_g = 110.0_f32;
-            let bg_b = 140.0_f32;
-
-            let r = bg_r * (1.0 - fg_alpha) + 255.0 * fg_alpha;
-            let g = bg_g * (1.0 - fg_alpha) + 255.0 * fg_alpha;
-            let b = bg_b * (1.0 - fg_alpha) + 255.0 * fg_alpha;
-            let a = bg_alpha * 255.0;
-
-            let idx = (y * size + x) * 4;
-            rgba[idx] = r.round() as u8;
-            rgba[idx + 1] = g.round() as u8;
-            rgba[idx + 2] = b.round() as u8;
-            rgba[idx + 3] = a.round() as u8;
-        }
-    }
-
-    rgba
+        capsule_dist.min(arc_dist).min(stem_dist).min(base_dist)
+    })
 }
 
 /// Generates a crisp 32x32 RGBA Paused badge icon (amber circle with pause bars) in pure Rust.
 pub fn render_paused_icon_rgba() -> Vec<u8> {
+    render_badge_icon_rgba([196.0, 128.0, 28.0], |p, center| {
+        // Two crisp vertical pause bars.
+        let left_bar = segment_distance(p, [center - 4.2, 9.8], [center - 4.2, 22.2]) - 2.1;
+        let right_bar = segment_distance(p, [center + 4.2, 9.8], [center + 4.2, 22.2]) - 2.1;
+        left_bar.min(right_bar)
+    })
+}
+
+fn render_badge_icon_rgba<F>(badge_rgb: [f32; 3], foreground_sdf: F) -> Vec<u8>
+where
+    F: Fn([f32; 2], f32) -> f32,
+{
     let size = ICON_SIZE as usize;
     let mut rgba = vec![0u8; size * size * 4];
     let center = (ICON_SIZE as f32 - 1.0) * 0.5;
+    let [bg_r, bg_g, bg_b] = badge_rgb;
 
     for y in 0..size {
         for x in 0..size {
@@ -210,20 +188,12 @@ pub fn render_paused_icon_rgba() -> Vec<u8> {
             let py = y as f32;
             let p = [px, py];
 
-            // Circular badge background matching the active icon geometry.
-            let bg_dist = ((px - center).hypot(py - center)) - 14.8;
+            // Circular badge background (visible on both light and dark Windows taskbars).
+            let bg_dist = (px - center).hypot(py - center) - 14.8;
             let bg_alpha = (0.5 - bg_dist).clamp(0.0, 1.0);
 
-            // Two crisp vertical pause bars.
-            let left_bar = segment_distance(p, [center - 4.2, 9.8], [center - 4.2, 22.2]) - 2.1;
-            let right_bar = segment_distance(p, [center + 4.2, 9.8], [center + 4.2, 22.2]) - 2.1;
-            let fg_dist = left_bar.min(right_bar);
+            let fg_dist = foreground_sdf(p, center);
             let fg_alpha = (0.5 - fg_dist).clamp(0.0, 1.0);
-
-            // Composite white foreground over warm amber badge.
-            let bg_r = 196.0_f32;
-            let bg_g = 128.0_f32;
-            let bg_b = 28.0_f32;
 
             let r = bg_r * (1.0 - fg_alpha) + 255.0 * fg_alpha;
             let g = bg_g * (1.0 - fg_alpha) + 255.0 * fg_alpha;

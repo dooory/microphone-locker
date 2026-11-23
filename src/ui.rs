@@ -81,6 +81,13 @@ impl<B: AudioBackend, S: StartupRegistry> SettingsApp<B, S> {
         }
     }
 
+    fn send_command_and_refresh(&mut self, command: AppCommand, snapshot: &mut AppSnapshot) {
+        self.send_command(command);
+        if let Some(updated) = self.snapshot() {
+            *snapshot = updated;
+        }
+    }
+
     fn show_and_focus_window(ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -207,11 +214,11 @@ impl<B: AudioBackend, S: StartupRegistry> eframe::App for SettingsApp<B, S> {
                             "Pause Locking"
                         };
                         if ui.button(button_label).clicked() {
-                            self.send_command(AppCommand::SetPaused(!snapshot.paused));
-                            if let Some(updated) = self.snapshot() {
-                                self.tray.sync_paused(updated.paused);
-                                snapshot = updated;
-                            }
+                            self.send_command_and_refresh(
+                                AppCommand::SetPaused(!snapshot.paused),
+                                &mut snapshot,
+                            );
+                            self.tray.sync_paused(snapshot.paused);
                         }
                     });
                 });
@@ -238,10 +245,10 @@ impl<B: AudioBackend, S: StartupRegistry> eframe::App for SettingsApp<B, S> {
                     .integer();
                 ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(120.0);
                 if ui.add(slider).changed() && default_volume != snapshot.default_volume {
-                    self.send_command(AppCommand::SetDefaultVolume(default_volume));
-                    if let Some(updated) = self.snapshot() {
-                        snapshot = updated;
-                    }
+                    self.send_command_and_refresh(
+                        AppCommand::SetDefaultVolume(default_volume),
+                        &mut snapshot,
+                    );
                 }
             });
 
@@ -252,10 +259,10 @@ impl<B: AudioBackend, S: StartupRegistry> eframe::App for SettingsApp<B, S> {
                 .changed()
                 && start_with_windows != snapshot.start_with_windows
             {
-                self.send_command(AppCommand::SetStartWithWindows(start_with_windows));
-                if let Some(updated) = self.snapshot() {
-                    snapshot = updated;
-                }
+                self.send_command_and_refresh(
+                    AppCommand::SetStartWithWindows(start_with_windows),
+                    &mut snapshot,
+                );
             }
 
             ui.add_space(12.0);
