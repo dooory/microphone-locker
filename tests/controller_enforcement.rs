@@ -976,3 +976,350 @@ target_volume = 60
     assert!(saved_toml.contains("Dock USB Mic"));
     assert!(saved_toml.contains("Travel Headset"));
 }
+
+#[test]
+fn setting_custom_target_volume_enforces_immediately_persists_to_toml_and_is_unaffected_by_default_volume_changes() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::with_microphones(vec![
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            friendly_name: "Blue Yeti".to_string(),
+            volume_scalar: 0.80,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-b}".to_string(),
+            friendly_name: "Headset Mic".to_string(),
+            volume_scalar: 0.80,
+        },
+    ]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    // Assign a custom Target Volume of 55% to mic-a.
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            lock_policy: LockPolicy::Custom(55),
+        })
+        .unwrap();
+
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.55)]
+    );
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-a}").unwrap() - 0.55).abs() < 1e-6);
+
+    let snapshot = controller.snapshot();
+    let by_id = microphones_by_id(&snapshot);
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-a}"].lock_policy,
+        LockPolicy::Custom(55)
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-a}"].effective_target_volume,
+        Some(55)
+    );
+    assert!((by_id["{0.0.1.00000000}.{mic-a}"].current_volume_scalar - 0.55).abs() < 1e-6);
+
+    // Changing Default Volume affects mic-b (FollowDefault) but leaves mic-a (Custom) untouched.
+    backend.clear_set_calls();
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(70))
+        .unwrap();
+
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-b}".to_string(), 0.70)]
+    );
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-a}").unwrap() - 0.55).abs() < 1e-6);
+
+    // Values above 100% clamp to 100%.
+    backend.clear_set_calls();
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            lock_policy: LockPolicy::Custom(150),
+        })
+        .unwrap();
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 1.0)]
+    );
+    assert_eq!(
+        microphones_by_id(&controller.snapshot())["{0.0.1.00000000}.{mic-a}"].lock_policy,
+        LockPolicy::Custom(100)
+    );
+
+    // Set back to 55% and verify TOML round-trip persistence across restart.
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            lock_policy: LockPolicy::Custom(55),
+        })
+        .unwrap();
+
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_toml.contains("policy = \"custom\""));
+    assert!(saved_toml.contains("target_volume = 55"));
+
+    let reload_backend = FakeAudioBackend::with_microphones(vec![
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            friendly_name: "Blue Yeti".to_string(),
+            volume_scalar: 0.90,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-b}".to_string(),
+            friendly_name: "Headset Mic".to_string(),
+            volume_scalar: 0.70,
+        },
+    ]);
+    let reloaded = AppController::start(reload_backend.clone(), config_path).unwrap();
+    assert_eq!(
+        reload_backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.55)]
+    );
+    let reloaded_snapshot = reloaded.snapshot();
+    let reloaded_by_id = microphones_by_id(&reloaded_snapshot);
+    assert_eq!(
+        reloaded_by_id["{0.0.1.00000000}.{mic-a}"].lock_policy,
+        LockPolicy::Custom(55)
+    );
+    assert_eq!(
+        reloaded_by_id["{0.0.1.00000000}.{mic-a}"].effective_target_volume,
+        Some(55)
+    );
+}
+
+#[test]
+fn resetting_custom_microphone_to_default_enforces_current_default_volume_and_persists() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 70
+
+[microphones."{0.0.1.00000000}.{mic-a}"]
+friendly_name = "Shure SM7B"
+policy = "custom"
+target_volume = 40
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Shure SM7B".to_string(),
+        volume_scalar: 0.40,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    // Reset to Default immediately enforces current Default Volume (70%).
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            lock_policy: LockPolicy::FollowDefault,
+        })
+        .unwrap();
+
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.70)]
+    );
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-a}").unwrap() - 0.70).abs() < 1e-6);
+
+    let snapshot = controller.snapshot();
+    assert_eq!(
+        snapshot.active_microphones[0].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert_eq!(
+        snapshot.active_microphones[0].effective_target_volume,
+        Some(70)
+    );
+    assert!((snapshot.active_microphones[0].current_volume_scalar - 0.70).abs() < 1e-6);
+
+    // Subsequent Default Volume changes now propagate to mic-a.
+    backend.clear_set_calls();
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(60))
+        .unwrap();
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.60)]
+    );
+
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_toml.contains("policy = \"follow_default\""));
+    assert!(!saved_toml.contains("target_volume"));
+
+    // Verify TOML round-trip across restart.
+    let reload_backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Shure SM7B".to_string(),
+        volume_scalar: 0.25,
+    }]);
+    let reloaded = AppController::start(reload_backend.clone(), config_path).unwrap();
+    assert_eq!(
+        reloaded.snapshot().active_microphones[0].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert_eq!(
+        reload_backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.60)]
+    );
+}
+
+#[test]
+fn marking_microphone_as_ignored_stops_enforcement_persists_across_restart_and_unignoring_re_enforces() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-virtual}".to_string(),
+        friendly_name: "Virtual Cable".to_string(),
+        volume_scalar: 0.80,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    // Mark as Ignored: does not touch volume.
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-virtual}".to_string(),
+            lock_policy: LockPolicy::Ignored,
+        })
+        .unwrap();
+
+    assert!(backend.set_calls().is_empty());
+    let snapshot = controller.snapshot();
+    assert_eq!(
+        snapshot.active_microphones[0].lock_policy,
+        LockPolicy::Ignored
+    );
+    assert_eq!(snapshot.active_microphones[0].effective_target_volume, None);
+
+    // External volume changes are ignored while Ignored, and Default Volume changes leave it untouched.
+    controller
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-virtual}".to_string(),
+            volume_scalar: 0.35,
+        })
+        .unwrap();
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(65))
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+    assert!(
+        (controller.snapshot().active_microphones[0].current_volume_scalar - 0.35).abs() < 1e-6
+    );
+
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_toml.contains("policy = \"ignored\""));
+
+    // Restart with volume at 0.35: Ignored persists and startup does not alter volume.
+    let restart_backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-virtual}".to_string(),
+        friendly_name: "Virtual Cable".to_string(),
+        volume_scalar: 0.35,
+    }]);
+    let mut restarted = AppController::start(restart_backend.clone(), config_path.clone()).unwrap();
+    assert!(restart_backend.set_calls().is_empty());
+    assert_eq!(
+        restarted.snapshot().active_microphones[0].lock_policy,
+        LockPolicy::Ignored
+    );
+
+    // Un-ignore returns the Microphone to Locked (FollowDefault) and immediately enforces Default Volume (65%).
+    restarted
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-virtual}".to_string(),
+            lock_policy: LockPolicy::FollowDefault,
+        })
+        .unwrap();
+
+    assert_eq!(
+        restart_backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-virtual}".to_string(), 0.65)]
+    );
+    let unignored_snapshot = restarted.snapshot();
+    assert_eq!(
+        unignored_snapshot.active_microphones[0].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert_eq!(
+        unignored_snapshot.active_microphones[0].effective_target_volume,
+        Some(65)
+    );
+    assert!((unignored_snapshot.active_microphones[0].current_volume_scalar - 0.65).abs() < 1e-6);
+
+    // External volume changes now revert again.
+    restart_backend.clear_set_calls();
+    restarted
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-virtual}".to_string(),
+            volume_scalar: 0.20,
+        })
+        .unwrap();
+    assert_eq!(
+        restart_backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-virtual}".to_string(), 0.65)]
+    );
+
+    // Un-ignored state persists across another restart.
+    let final_backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-virtual}".to_string(),
+        friendly_name: "Virtual Cable".to_string(),
+        volume_scalar: 0.10,
+    }]);
+    let final_controller = AppController::start(final_backend.clone(), config_path).unwrap();
+    assert_eq!(
+        final_controller.snapshot().active_microphones[0].lock_policy,
+        LockPolicy::FollowDefault
+    );
+    assert_eq!(
+        final_backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-virtual}".to_string(), 0.65)]
+    );
+}
+
+#[test]
+fn setting_lock_policy_for_unknown_or_unchanged_microphone_is_noop() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.80,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path).unwrap();
+    backend.clear_set_calls();
+
+    // Unknown endpoint ID is a clean no-op.
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{does-not-exist}".to_string(),
+            lock_policy: LockPolicy::Custom(42),
+        })
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+
+    // Re-applying the existing LockPolicy is a no-op.
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            lock_policy: LockPolicy::FollowDefault,
+        })
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+}

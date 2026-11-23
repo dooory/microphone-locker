@@ -34,6 +34,10 @@ pub struct MicrophoneSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     SetDefaultVolume(u8),
+    SetMicrophoneLockPolicy {
+        endpoint_id: String,
+        lock_policy: LockPolicy,
+    },
     SetStartWithWindows(bool),
 }
 
@@ -127,6 +131,37 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                     {
                         mic.volume_scalar = enforced_scalar;
                     }
+                }
+            }
+            AppCommand::SetMicrophoneLockPolicy {
+                endpoint_id,
+                lock_policy,
+            } => {
+                let normalized_policy = match lock_policy {
+                    LockPolicy::Custom(target) => LockPolicy::Custom(target.min(100)),
+                    other => other,
+                };
+
+                let Some(entry) = self.config.microphones.get_mut(&endpoint_id) else {
+                    return Ok(());
+                };
+
+                if entry.lock_policy == normalized_policy {
+                    return Ok(());
+                }
+
+                entry.lock_policy = normalized_policy;
+                save_config(&self.config_path, &self.config)?;
+
+                if let Some(current_scalar) = self
+                    .active_microphones
+                    .get(&endpoint_id)
+                    .map(|mic| mic.volume_scalar)
+                    && let Some(enforced_scalar) =
+                        self.enforce_if_needed(&endpoint_id, current_scalar)?
+                    && let Some(mic) = self.active_microphones.get_mut(&endpoint_id)
+                {
+                    mic.volume_scalar = enforced_scalar;
                 }
             }
             AppCommand::SetStartWithWindows(enabled) => {
