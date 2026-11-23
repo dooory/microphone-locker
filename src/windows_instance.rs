@@ -5,7 +5,6 @@
 //! `AllowSetForegroundWindow(ASFW_ANY)`, signals the named show-window event,
 //! and exits immediately.
 
-use std::ffi::c_void;
 use std::thread::{self, JoinHandle};
 
 use windows::Win32::Foundation::{
@@ -20,6 +19,42 @@ use windows::core::{HSTRING, PCWSTR};
 
 const DEFAULT_INSTANCE_PREFIX: &str = "Local\\MicrophoneLocker.SingleInstance";
 
+/// RAII wrapper around an owned Win32 kernel `HANDLE` that closes it on `Drop`.
+struct OwnedHandle(HANDLE);
+
+// SAFETY: Win32 kernel mutex/event handles are process-wide and safe to transfer
+// across threads when ownership and drop ordering are upheld.
+unsafe impl Send for OwnedHandle {}
+
+impl OwnedHandle {
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: `self.0` is an owned Win32 kernel handle closed exactly once on drop.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Non-owning `Send` wrapper for passing a kernel event `HANDLE` to the listener thread.
+#[derive(Clone, Copy)]
+struct SendHandle(HANDLE);
+
+// SAFETY: The referenced handle is owned by `SingleInstanceGuard`, which signals
+// `shutdown_event` and joins the listener thread before closing any handle.
+unsafe impl Send for SendHandle {}
+
+impl SendHandle {
+    fn raw(self) -> HANDLE {
+        self.0
+    }
+}
+
 /// Outcome of attempting to acquire the single-instance guard at startup.
 pub enum InstanceLock {
     /// This process is the primary running instance and owns the guard.
@@ -31,10 +66,12 @@ pub enum InstanceLock {
 /// Owns the named mutex, activation event, and optional listener thread.
 /// Dropping this guard stops the listener thread and closes all Win32 handles.
 pub struct SingleInstanceGuard {
-    mutex: isize,
-    show_event: isize,
-    shutdown_event: isize,
     listener: Option<JoinHandle<()>>,
+    // `Drop::drop` signals `shutdown_event` and joins `listener` before Rust drops
+    // these `OwnedHandle` fields.
+    shutdown_event: OwnedHandle,
+    show_event: OwnedHandle,
+    _mutex: OwnedHandle,
 }
 
 impl SingleInstanceGuard {
@@ -50,44 +87,36 @@ impl SingleInstanceGuard {
         let event_name = HSTRING::from(format!("{prefix}.ShowEvent"));
 
         // SAFETY: `mutex_name` is a valid NUL-terminated UTF-16 HSTRING.
-        let mutex = unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) }
-            .map_err(|err| format!("CreateMutexW failed: {err}"))?;
+        let mutex = OwnedHandle(
+            unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) }
+                .map_err(|err| format!("CreateMutexW failed: {err}"))?,
+        );
         // SAFETY: Checking thread-local last error immediately after CreateMutexW.
         let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
 
         if already_exists {
-            // SAFETY: Closing the duplicate handle before signaling the primary instance.
-            let _ = unsafe { CloseHandle(mutex) };
+            drop(mutex);
             signal_existing_instance(&event_name);
             return Ok(InstanceLock::SecondarySignaled);
         }
 
         // SAFETY: Creating named auto-reset event for secondary -> primary focus signaling.
-        let show_event = match unsafe {
-            CreateEventW(None, false, false, PCWSTR(event_name.as_ptr()))
-        } {
-            Ok(h) => h,
-            Err(err) => {
-                let _ = unsafe { CloseHandle(mutex) };
-                return Err(format!("CreateEventW(show_event) failed: {err}"));
-            }
-        };
+        let show_event = OwnedHandle(
+            unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) }
+                .map_err(|err| format!("CreateEventW(show_event) failed: {err}"))?,
+        );
 
         // SAFETY: Creating unnamed manual-reset event to cleanly wake the listener thread on Drop.
-        let shutdown_event = match unsafe { CreateEventW(None, true, false, None) } {
-            Ok(h) => h,
-            Err(err) => {
-                let _ = unsafe { CloseHandle(show_event) };
-                let _ = unsafe { CloseHandle(mutex) };
-                return Err(format!("CreateEventW(shutdown_event) failed: {err}"));
-            }
-        };
+        let shutdown_event = OwnedHandle(
+            unsafe { CreateEventW(None, true, false, None) }
+                .map_err(|err| format!("CreateEventW(shutdown_event) failed: {err}"))?,
+        );
 
         Ok(InstanceLock::Primary(Self {
-            mutex: mutex.0 as isize,
-            show_event: show_event.0 as isize,
-            shutdown_event: shutdown_event.0 as isize,
             listener: None,
+            shutdown_event,
+            show_event,
+            _mutex: mutex,
         }))
     }
 
@@ -101,16 +130,13 @@ impl SingleInstanceGuard {
             return Ok(());
         }
 
-        let shutdown_raw = self.shutdown_event;
-        let show_raw = self.show_event;
+        let shutdown = SendHandle(self.shutdown_event.raw());
+        let show = SendHandle(self.show_event.raw());
 
         let handle = thread::Builder::new()
             .name("single-instance-listener".to_string())
             .spawn(move || {
-                let handles = [
-                    HANDLE(shutdown_raw as *mut c_void),
-                    HANDLE(show_raw as *mut c_void),
-                ];
+                let handles = [shutdown.raw(), show.raw()];
                 loop {
                     // SAFETY: Both event handles remain valid until `SingleInstanceGuard::drop`
                     // signals `shutdown_event` and joins this thread before closing handles.
@@ -135,28 +161,10 @@ impl SingleInstanceGuard {
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
-        if self.shutdown_event != 0 {
-            let shutdown = HANDLE(self.shutdown_event as *mut c_void);
-            // SAFETY: Wakes the listener thread so `join` completes immediately.
-            let _ = unsafe { SetEvent(shutdown) };
-        }
+        // SAFETY: Wakes the listener thread so `join` completes before `OwnedHandle` fields drop.
+        let _ = unsafe { SetEvent(self.shutdown_event.raw()) };
         if let Some(listener) = self.listener.take() {
             let _ = listener.join();
-        }
-        // SAFETY: All listener threads have exited; close owned kernel handles once.
-        unsafe {
-            if self.shutdown_event != 0 {
-                let _ = CloseHandle(HANDLE(self.shutdown_event as *mut c_void));
-                self.shutdown_event = 0;
-            }
-            if self.show_event != 0 {
-                let _ = CloseHandle(HANDLE(self.show_event as *mut c_void));
-                self.show_event = 0;
-            }
-            if self.mutex != 0 {
-                let _ = CloseHandle(HANDLE(self.mutex as *mut c_void));
-                self.mutex = 0;
-            }
         }
     }
 }
@@ -169,8 +177,8 @@ fn signal_existing_instance(event_name: &HSTRING) {
     // SAFETY: Opens the primary instance's named event with `EVENT_MODIFY_STATE`.
     if let Ok(event) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(event_name.as_ptr())) }
     {
-        let _ = unsafe { SetEvent(event) };
-        let _ = unsafe { CloseHandle(event) };
+        let event = OwnedHandle(event);
+        let _ = unsafe { SetEvent(event.raw()) };
     }
 }
 

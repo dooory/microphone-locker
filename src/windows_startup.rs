@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+    REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
     RegSetValueExW,
 };
 use windows::core::{PCWSTR, w};
@@ -62,7 +62,7 @@ impl StartupRegistry for WindowsStartupRegistry {
         check_win32(open_status, "open HKCU Run key for query")?;
         let _guard = RegKeyGuard(hkey);
 
-        let mut value_type = windows::Win32::System::Registry::REG_VALUE_TYPE::default();
+        let mut value_type = REG_VALUE_TYPE::default();
         let mut byte_len: u32 = 0;
         // SAFETY: `hkey` is open for `KEY_QUERY_VALUE` and `APP_VALUE_NAME` is a valid PCWSTR.
         let query_status = unsafe {
@@ -81,7 +81,31 @@ impl StartupRegistry for WindowsStartupRegistry {
         }
         check_win32(query_status, "query MicrophoneLocker startup entry")?;
 
-        Ok(byte_len > 2)
+        if value_type != REG_SZ || byte_len == 0 {
+            return Ok(false);
+        }
+
+        let mut buffer = vec![0u8; byte_len as usize];
+        // SAFETY: `hkey` is open for `KEY_QUERY_VALUE` and `buffer` has capacity `byte_len` bytes.
+        let read_status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                APP_VALUE_NAME,
+                None,
+                Some(&mut value_type),
+                Some(buffer.as_mut_ptr()),
+                Some(&mut byte_len),
+            )
+        };
+
+        if read_status == ERROR_FILE_NOT_FOUND {
+            return Ok(false);
+        }
+        check_win32(read_status, "read MicrophoneLocker startup entry")?;
+        buffer.truncate(byte_len as usize);
+
+        let expected = format_run_command(&self.executable_path);
+        Ok(registry_value_matches_command(value_type, &buffer, &expected))
     }
 
     fn set_enabled(&self, enabled: bool) -> Result<(), StartupError> {
@@ -174,9 +198,42 @@ fn format_run_command(executable_path: &Path) -> String {
     format!("\"{}\"", executable_path.display())
 }
 
+fn registry_value_matches_command(
+    value_type: REG_VALUE_TYPE,
+    raw_bytes: &[u8],
+    expected_command: &str,
+) -> bool {
+    let (chunks, remainder) = raw_bytes.as_chunks::<2>();
+    if value_type != REG_SZ || !remainder.is_empty() {
+        return false;
+    }
+
+    let wide: Vec<u16> = chunks.iter().copied().map(u16::from_le_bytes).collect();
+
+    let trimmed = match wide.iter().position(|&unit| unit == 0) {
+        Some(nul_pos) => &wide[..nul_pos],
+        None => &wide[..],
+    };
+
+    String::from_utf16(trimmed).is_ok_and(|stored| stored == expected_command)
+}
+
 #[cfg(test)]
 mod tests {
+    use windows::Win32::System::Registry::{REG_DWORD, REG_EXPAND_SZ};
+
     use super::*;
+
+    fn encode_utf16_le_bytes(s: &str, nul_terminated: bool) -> Vec<u8> {
+        let mut units: Vec<u16> = OsStr::new(s).encode_wide().collect();
+        if nul_terminated {
+            units.push(0);
+        }
+        units
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
 
     #[test]
     fn format_run_command_quotes_executable_path_with_spaces() {
@@ -185,5 +242,42 @@ mod tests {
             format_run_command(&path),
             r#""C:\Program Files\Microphone Locker\microphone-locker.exe""#
         );
+    }
+
+    #[test]
+    fn registry_value_matches_exact_reg_sz_command() {
+        let expected = r#""C:\Program Files\Microphone Locker\microphone-locker.exe""#;
+        let bytes = encode_utf16_le_bytes(expected, true);
+        assert!(registry_value_matches_command(REG_SZ, &bytes, expected));
+
+        // Also accepts non-NUL-terminated REG_SZ buffers.
+        let no_nul = encode_utf16_le_bytes(expected, false);
+        assert!(registry_value_matches_command(REG_SZ, &no_nul, expected));
+    }
+
+    #[test]
+    fn registry_value_rejects_wrong_type_mismatched_path_or_malformed_bytes() {
+        let expected = r#""C:\Program Files\Microphone Locker\microphone-locker.exe""#;
+        let matching_bytes = encode_utf16_le_bytes(expected, true);
+
+        assert!(!registry_value_matches_command(
+            REG_EXPAND_SZ,
+            &matching_bytes,
+            expected
+        ));
+        assert!(!registry_value_matches_command(
+            REG_DWORD,
+            &matching_bytes,
+            expected
+        ));
+
+        let other_path = encode_utf16_le_bytes(r#""D:\Other\microphone-locker.exe""#, true);
+        assert!(!registry_value_matches_command(REG_SZ, &other_path, expected));
+
+        let empty_nul = encode_utf16_le_bytes("", true);
+        assert!(!registry_value_matches_command(REG_SZ, &empty_nul, expected));
+
+        // Odd byte count is invalid UTF-16.
+        assert!(!registry_value_matches_command(REG_SZ, &[0x22, 0x00, 0x41], expected));
     }
 }

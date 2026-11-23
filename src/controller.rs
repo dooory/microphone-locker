@@ -128,25 +128,20 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                 self.config.default_volume = clamped;
                 save_config(&self.config_path, &self.config)?;
 
-                let follow_default_mics: Vec<(String, f32)> = self
+                let follow_default_ids: Vec<String> = self
                     .active_microphones
-                    .values()
-                    .filter(|mic| {
+                    .keys()
+                    .filter(|endpoint_id| {
                         self.config
                             .microphones
-                            .get(&mic.endpoint_id)
+                            .get(*endpoint_id)
                             .is_some_and(|entry| entry.lock_policy == LockPolicy::FollowDefault)
                     })
-                    .map(|mic| (mic.endpoint_id.clone(), mic.volume_scalar))
+                    .cloned()
                     .collect();
 
-                for (endpoint_id, current_scalar) in follow_default_mics {
-                    if let Some(enforced_scalar) =
-                        self.enforce_if_needed(&endpoint_id, current_scalar)?
-                        && let Some(mic) = self.active_microphones.get_mut(&endpoint_id)
-                    {
-                        mic.volume_scalar = enforced_scalar;
-                    }
+                for endpoint_id in follow_default_ids {
+                    self.enforce_active_microphone(&endpoint_id)?;
                 }
             }
             AppCommand::SetMicrophoneLockPolicy {
@@ -169,16 +164,7 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                 entry.lock_policy = normalized_policy;
                 save_config(&self.config_path, &self.config)?;
 
-                if let Some(current_scalar) = self
-                    .active_microphones
-                    .get(&endpoint_id)
-                    .map(|mic| mic.volume_scalar)
-                    && let Some(enforced_scalar) =
-                        self.enforce_if_needed(&endpoint_id, current_scalar)?
-                    && let Some(mic) = self.active_microphones.get_mut(&endpoint_id)
-                {
-                    mic.volume_scalar = enforced_scalar;
-                }
+                self.enforce_active_microphone(&endpoint_id)?;
             }
             AppCommand::ForgetMicrophone { endpoint_id } => {
                 if self.active_microphones.contains_key(&endpoint_id) {
@@ -193,21 +179,8 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                     return Ok(());
                 }
                 self.paused = paused;
-                if !self.paused {
-                    let active_mics: Vec<(String, f32)> = self
-                        .active_microphones
-                        .values()
-                        .map(|mic| (mic.endpoint_id.clone(), mic.volume_scalar))
-                        .collect();
-
-                    for (endpoint_id, current_scalar) in active_mics {
-                        if let Some(enforced_scalar) =
-                            self.enforce_if_needed(&endpoint_id, current_scalar)?
-                            && let Some(mic) = self.active_microphones.get_mut(&endpoint_id)
-                        {
-                            mic.volume_scalar = enforced_scalar;
-                        }
-                    }
+                if !self.paused && self.reconcile_active_microphones()? {
+                    save_config(&self.config_path, &self.config)?;
                 }
             }
             AppCommand::SetStartWithWindows(enabled) => {
@@ -369,6 +342,20 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                 true
             }
         }
+    }
+
+    fn enforce_active_microphone(&mut self, endpoint_id: &str) -> Result<(), ControllerError> {
+        if let Some(current_scalar) = self
+            .active_microphones
+            .get(endpoint_id)
+            .map(|mic| mic.volume_scalar)
+            && let Some(enforced_scalar) =
+                self.enforce_if_needed(endpoint_id, current_scalar)?
+            && let Some(mic) = self.active_microphones.get_mut(endpoint_id)
+        {
+            mic.volume_scalar = enforced_scalar;
+        }
+        Ok(())
     }
 
     fn enforce_if_needed(
