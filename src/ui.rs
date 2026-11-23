@@ -7,7 +7,9 @@ use eframe::egui;
 
 use crate::audio::AudioBackend;
 use crate::config::LockPolicy;
-use crate::controller::{AppCommand, AppController, AppSnapshot, MicrophoneSnapshot};
+use crate::controller::{
+    AppCommand, AppController, AppSnapshot, DisconnectedMicrophoneSnapshot, MicrophoneSnapshot,
+};
 use crate::tray::{SystemTray, TrayAction, window_icon_data};
 
 /// Runs the native Windows system tray + `egui` settings window event loop.
@@ -194,6 +196,28 @@ impl<B: AudioBackend> eframe::App for SettingsApp<B> {
                             ui.add_space(6.0);
                         }
                     }
+
+                    if !snapshot.disconnected_microphones.is_empty() {
+                        ui.add_space(10.0);
+                        egui::CollapsingHeader::new(format!(
+                            "Disconnected Microphones ({})",
+                            snapshot.disconnected_microphones.len()
+                        ))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            for mic in &snapshot.disconnected_microphones {
+                                if let Some(cmd) = render_disconnected_microphone_row(
+                                    ui,
+                                    mic,
+                                    snapshot.default_volume,
+                                ) {
+                                    pending_commands.push(cmd);
+                                }
+                                ui.add_space(6.0);
+                            }
+                        });
+                    }
                 });
 
             for cmd in pending_commands {
@@ -245,11 +269,7 @@ fn render_microphone_row(
             });
 
             ui.horizontal(|ui| {
-                let policy_text = match mic.lock_policy {
-                    LockPolicy::FollowDefault => format!("Following Default ({default_volume}%)"),
-                    LockPolicy::Custom(target) => format!("Custom Target Volume ({target}%)"),
-                    LockPolicy::Ignored => "Ignored (not enforced)".to_string(),
-                };
+                let policy_text = format_lock_policy_label(mic.lock_policy, default_volume);
                 ui.label(egui::RichText::new(policy_text).small().weak());
 
                 if is_custom && ui.small_button("Reset to Default").clicked() {
@@ -291,4 +311,42 @@ fn render_microphone_row(
     });
 
     command
+}
+
+fn render_disconnected_microphone_row(
+    ui: &mut egui::Ui,
+    mic: &DisconnectedMicrophoneSnapshot,
+    default_volume: u8,
+) -> Option<AppCommand> {
+    let mut command = None;
+
+    ui.push_id(("disconnected", &mic.endpoint_id), |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.strong(&mic.friendly_name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Forget").clicked() {
+                        command = Some(AppCommand::ForgetMicrophone {
+                            endpoint_id: mic.endpoint_id.clone(),
+                        });
+                    }
+                });
+            });
+
+            let policy_text = format_lock_policy_label(mic.lock_policy, default_volume);
+            ui.label(egui::RichText::new(policy_text).small().weak());
+        });
+    });
+
+    command
+}
+
+fn format_lock_policy_label(lock_policy: LockPolicy, default_volume: u8) -> String {
+    match lock_policy {
+        LockPolicy::FollowDefault => format!("Following Default ({default_volume}%)"),
+        LockPolicy::Custom(target) => format!("Custom Target Volume ({target}%)"),
+        LockPolicy::Ignored => "Ignored (not enforced)".to_string(),
+    }
 }

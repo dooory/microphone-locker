@@ -29,11 +29,22 @@ pub struct MicrophoneSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectedMicrophoneSnapshot {
+    pub endpoint_id: String,
+    pub friendly_name: String,
+    pub lock_policy: LockPolicy,
+    pub effective_target_volume: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     SetDefaultVolume(u8),
     SetMicrophoneLockPolicy {
         endpoint_id: String,
         lock_policy: LockPolicy,
+    },
+    ForgetMicrophone {
+        endpoint_id: String,
     },
 }
 
@@ -41,6 +52,7 @@ pub enum AppCommand {
 pub struct AppSnapshot {
     pub default_volume: u8,
     pub active_microphones: Vec<MicrophoneSnapshot>,
+    pub disconnected_microphones: Vec<DisconnectedMicrophoneSnapshot>,
 }
 
 pub struct AppController<B: AudioBackend> {
@@ -148,6 +160,14 @@ impl<B: AudioBackend> AppController<B> {
                     mic.volume_scalar = enforced_scalar;
                 }
             }
+            AppCommand::ForgetMicrophone { endpoint_id } => {
+                if self.active_microphones.contains_key(&endpoint_id) {
+                    return Ok(());
+                }
+                if self.config.microphones.remove(&endpoint_id).is_some() {
+                    save_config(&self.config_path, &self.config)?;
+                }
+            }
         }
         Ok(())
     }
@@ -224,9 +244,25 @@ impl<B: AudioBackend> AppController<B> {
             })
             .collect();
 
+        let disconnected_microphones = self
+            .config
+            .microphones
+            .iter()
+            .filter(|(endpoint_id, _)| !self.active_microphones.contains_key(*endpoint_id))
+            .map(|(endpoint_id, entry)| DisconnectedMicrophoneSnapshot {
+                endpoint_id: endpoint_id.clone(),
+                friendly_name: entry.friendly_name.clone(),
+                lock_policy: entry.lock_policy,
+                effective_target_volume: entry
+                    .lock_policy
+                    .resolve_target_volume(self.config.default_volume),
+            })
+            .collect();
+
         AppSnapshot {
             default_volume: self.config.default_volume,
             active_microphones,
+            disconnected_microphones,
         }
     }
 
