@@ -47,6 +47,14 @@ impl FakeAudioBackend {
         self.state.lock().unwrap().microphones.push(mic);
     }
 
+    fn remove_microphone(&self, endpoint_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .microphones
+            .retain(|m| m.endpoint_id != endpoint_id);
+    }
+
     fn current_volume(&self, endpoint_id: &str) -> Option<f32> {
         self.state
             .lock()
@@ -482,4 +490,77 @@ fn corrupt_config_toml_returns_parse_error() {
         err,
         ControllerError::Config(ConfigError::Parse { .. })
     ));
+}
+
+#[test]
+fn disconnecting_microphone_removes_it_from_active_list_and_reconnecting_restores_lock_policy() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 80
+
+[microphones."{0.0.1.00000000}.{mic-usb}"]
+friendly_name = "Blue Yeti"
+policy = "custom"
+target_volume = 55
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-usb}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.55,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    // Unplug the Microphone.
+    backend.remove_microphone("{0.0.1.00000000}.{mic-usb}");
+    controller
+        .handle_event(AudioEvent::MicrophoneDisconnected {
+            endpoint_id: "{0.0.1.00000000}.{mic-usb}".to_string(),
+        })
+        .unwrap();
+
+    assert!(controller.snapshot().active_microphones.is_empty());
+
+    // Any stale volume event after disconnect is a no-op and does not error.
+    controller
+        .handle_event(AudioEvent::ExternalVolumeChanged {
+            endpoint_id: "{0.0.1.00000000}.{mic-usb}".to_string(),
+            volume_scalar: 0.20,
+        })
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+
+    // Replugging the same Endpoint ID immediately enforces its preserved custom Target Volume.
+    let reconnected = ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-usb}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.90,
+    };
+    backend.add_microphone(reconnected.clone());
+    controller
+        .handle_event(AudioEvent::MicrophoneConnected(reconnected))
+        .unwrap();
+
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-usb}".to_string(), 0.55)]
+    );
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.active_microphones.len(), 1);
+    assert_eq!(
+        snapshot.active_microphones[0].lock_policy,
+        LockPolicy::Custom(55)
+    );
+    assert_eq!(
+        snapshot.active_microphones[0].effective_target_volume,
+        Some(55)
+    );
 }

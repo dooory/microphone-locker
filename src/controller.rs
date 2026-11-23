@@ -101,6 +101,9 @@ impl<B: AudioBackend> AppController<B> {
                     save_config(&self.config_path, &self.config)?;
                 }
             }
+            AudioEvent::MicrophoneDisconnected { endpoint_id } => {
+                self.active_microphones.remove(&endpoint_id);
+            }
             AudioEvent::FriendlyNameChanged {
                 endpoint_id,
                 friendly_name,

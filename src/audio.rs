@@ -18,6 +18,9 @@ pub enum AudioEvent {
         volume_scalar: f32,
     },
     MicrophoneConnected(ActiveMicrophone),
+    MicrophoneDisconnected {
+        endpoint_id: String,
+    },
     FriendlyNameChanged {
         endpoint_id: String,
         friendly_name: String,
