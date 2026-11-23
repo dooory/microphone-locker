@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and specs are tracked as local markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+Issues and specs are tracked in GitHub Issues (`dooory/microphone-locker`) via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
