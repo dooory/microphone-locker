@@ -1,1 +1,10 @@
 /target
+
+# Local teaching workspace (gitignored)
+/MISSION.md
+/RESOURCES.md
+/NOTES.md
+/lessons/
+/reference/
+/learning-records/
+/assets/
