@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 #[cfg(windows)]
 fn main() {
     if let Err(err) = run() {
@@ -8,60 +10,54 @@ fn main() {
 
 #[cfg(windows)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use microphone_locker::audio::AudioEvent;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread;
+
     use microphone_locker::config::default_config_path;
     use microphone_locker::controller::AppController;
+    use microphone_locker::ui;
     use microphone_locker::windows_audio::WindowsAudioBackend;
 
     let config_path = default_config_path()?;
     let (backend, event_rx) = WindowsAudioBackend::start()?;
-    let mut controller = AppController::start(backend, config_path.clone())?;
+    let controller = AppController::start(backend, config_path)?;
+    let open_window_on_startup = controller.should_open_window_on_startup();
 
-    let snapshot = controller.snapshot();
-    println!(
-        "Microphone Locker running (Default Volume: {}%, config: {})",
-        snapshot.default_volume,
-        config_path.display()
-    );
-    for mic in &snapshot.active_microphones {
-        match mic.effective_target_volume {
-            Some(target) => println!(
-                "  Locked: {} -> {}% ({})",
-                mic.friendly_name, target, mic.endpoint_id
-            ),
-            None => println!(
-                "  Ignored: {} ({})",
-                mic.friendly_name, mic.endpoint_id
-            ),
-        }
-    }
+    let controller = Arc::new(Mutex::new(controller));
+    let weak_controller = Arc::downgrade(&controller);
+    let egui_ctx_slot = Arc::new(OnceLock::<eframe::egui::Context>::new());
+    let audio_egui_ctx = Arc::clone(&egui_ctx_slot);
 
-    for event in event_rx {
-        match &event {
-            AudioEvent::MicrophoneConnected(mic) => {
-                println!(
-                    "Microphone connected: {} ({})",
-                    mic.friendly_name, mic.endpoint_id
-                );
+    // Process real-time Core Audio events independently of window visibility so
+    // volume enforcement continues while minimized to the system tray.
+    let audio_event_thread = thread::Builder::new()
+        .name("audio-event-loop".to_string())
+        .spawn(move || {
+            for event in event_rx {
+                let Some(ctrl) = weak_controller.upgrade() else {
+                    break;
+                };
+                match ctrl.lock() {
+                    Ok(mut ctrl) => {
+                        if let Err(err) = ctrl.handle_event(event) {
+                            eprintln!("event handling error: {err}");
+                        }
+                    }
+                    Err(_) => break,
+                }
+                if let Some(ctx) = audio_egui_ctx.get() {
+                    ctx.request_repaint();
+                }
             }
-            AudioEvent::MicrophoneDisconnected { endpoint_id } => {
-                println!("Microphone disconnected: {endpoint_id}");
-            }
-            AudioEvent::FriendlyNameChanged {
-                endpoint_id,
-                friendly_name,
-            } => {
-                println!("Microphone renamed: {friendly_name} ({endpoint_id})");
-            }
-            AudioEvent::ExternalVolumeChanged { .. } => {}
-        }
+        })?;
 
-        if let Err(err) = controller.handle_event(event) {
-            eprintln!("event handling error: {err}");
-        }
-    }
+    let ui_result = ui::run_app(controller, open_window_on_startup, egui_ctx_slot);
 
-    Ok(())
+    // Dropping the last Arc<Mutex<AppController>> inside run_app drops
+    // WindowsAudioBackend, which stops the COM worker and closes event_rx.
+    let _ = audio_event_thread.join();
+
+    ui_result
 }
 
 #[cfg(not(windows))]

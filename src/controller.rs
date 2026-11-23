@@ -28,6 +28,11 @@ pub struct MicrophoneSnapshot {
     pub current_volume_scalar: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppCommand {
+    SetDefaultVolume(u8),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppSnapshot {
     pub default_volume: u8,
@@ -75,6 +80,41 @@ impl<B: AudioBackend> AppController<B> {
 
     pub fn should_open_window_on_startup(&self) -> bool {
         self.open_window_on_startup
+    }
+
+    pub fn handle_command(&mut self, command: AppCommand) -> Result<(), ControllerError> {
+        match command {
+            AppCommand::SetDefaultVolume(percent) => {
+                let clamped = percent.min(100);
+                if self.config.default_volume == clamped {
+                    return Ok(());
+                }
+                self.config.default_volume = clamped;
+                save_config(&self.config_path, &self.config)?;
+
+                let follow_default_mics: Vec<(String, f32)> = self
+                    .active_microphones
+                    .values()
+                    .filter(|mic| {
+                        self.config
+                            .microphones
+                            .get(&mic.endpoint_id)
+                            .is_some_and(|entry| entry.lock_policy == LockPolicy::FollowDefault)
+                    })
+                    .map(|mic| (mic.endpoint_id.clone(), mic.volume_scalar))
+                    .collect();
+
+                for (endpoint_id, current_scalar) in follow_default_mics {
+                    if let Some(enforced_scalar) =
+                        self.enforce_if_needed(&endpoint_id, current_scalar)?
+                        && let Some(mic) = self.active_microphones.get_mut(&endpoint_id)
+                    {
+                        mic.volume_scalar = enforced_scalar;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn handle_event(&mut self, event: AudioEvent) -> Result<(), ControllerError> {

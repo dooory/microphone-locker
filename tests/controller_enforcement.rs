@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use microphone_locker::audio::{ActiveMicrophone, AudioBackend, AudioError, AudioEvent};
 use microphone_locker::config::{ConfigError, LockPolicy};
-use microphone_locker::controller::{AppController, AppSnapshot, ControllerError, MicrophoneSnapshot};
+use microphone_locker::controller::{
+    AppCommand, AppController, AppSnapshot, ControllerError, MicrophoneSnapshot,
+};
 use tempfile::TempDir;
 
 fn microphones_by_id(snapshot: &AppSnapshot) -> HashMap<&str, &MicrophoneSnapshot> {
@@ -563,4 +565,177 @@ target_volume = 55
         snapshot.active_microphones[0].effective_target_volume,
         Some(55)
     );
+}
+
+#[test]
+fn setting_default_volume_updates_follow_default_microphones_preserves_custom_and_ignored_and_persists_across_reload() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+default_volume = 80
+
+[microphones."{0.0.1.00000000}.{mic-a}"]
+friendly_name = "Blue Yeti"
+policy = "follow_default"
+
+[microphones."{0.0.1.00000000}.{mic-b}"]
+friendly_name = "Headset Mic"
+policy = "follow_default"
+
+[microphones."{0.0.1.00000000}.{mic-custom}"]
+friendly_name = "Shure SM7B"
+policy = "custom"
+target_volume = 55
+
+[microphones."{0.0.1.00000000}.{mic-ignored}"]
+friendly_name = "Virtual Cable"
+policy = "ignored"
+"#,
+    )
+    .unwrap();
+
+    let backend = FakeAudioBackend::with_microphones(vec![
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            friendly_name: "Blue Yeti".to_string(),
+            volume_scalar: 0.80,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-b}".to_string(),
+            friendly_name: "Headset Mic".to_string(),
+            volume_scalar: 0.80,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-custom}".to_string(),
+            friendly_name: "Shure SM7B".to_string(),
+            volume_scalar: 0.55,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-ignored}".to_string(),
+            friendly_name: "Virtual Cable".to_string(),
+            volume_scalar: 0.30,
+        },
+    ]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(65))
+        .unwrap();
+
+    assert_eq!(
+        backend.set_calls(),
+        vec![
+            ("{0.0.1.00000000}.{mic-a}".to_string(), 0.65),
+            ("{0.0.1.00000000}.{mic-b}".to_string(), 0.65),
+        ]
+    );
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-a}").unwrap() - 0.65).abs() < 1e-6);
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-b}").unwrap() - 0.65).abs() < 1e-6);
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-custom}").unwrap() - 0.55).abs() < 1e-6);
+    assert!((backend.current_volume("{0.0.1.00000000}.{mic-ignored}").unwrap() - 0.30).abs() < 1e-6);
+
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.default_volume, 65);
+    let by_id = microphones_by_id(&snapshot);
+    assert_eq!(by_id["{0.0.1.00000000}.{mic-a}"].effective_target_volume, Some(65));
+    assert!((by_id["{0.0.1.00000000}.{mic-a}"].current_volume_scalar - 0.65).abs() < 1e-6);
+    assert_eq!(by_id["{0.0.1.00000000}.{mic-b}"].effective_target_volume, Some(65));
+    assert!((by_id["{0.0.1.00000000}.{mic-b}"].current_volume_scalar - 0.65).abs() < 1e-6);
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-custom}"].lock_policy,
+        LockPolicy::Custom(55)
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-custom}"].effective_target_volume,
+        Some(55)
+    );
+    assert_eq!(
+        by_id["{0.0.1.00000000}.{mic-ignored}"].lock_policy,
+        LockPolicy::Ignored
+    );
+    assert_eq!(by_id["{0.0.1.00000000}.{mic-ignored}"].effective_target_volume, None);
+
+    // Reload from disk with drifted microphone volumes and verify 65% persists and is enforced.
+    let reload_backend = FakeAudioBackend::with_microphones(vec![
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            friendly_name: "Blue Yeti".to_string(),
+            volume_scalar: 0.20,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-b}".to_string(),
+            friendly_name: "Headset Mic".to_string(),
+            volume_scalar: 0.95,
+        },
+        ActiveMicrophone {
+            endpoint_id: "{0.0.1.00000000}.{mic-custom}".to_string(),
+            friendly_name: "Shure SM7B".to_string(),
+            volume_scalar: 0.55,
+        },
+    ]);
+    let reloaded = AppController::start(reload_backend.clone(), config_path).unwrap();
+    assert!(!reloaded.should_open_window_on_startup());
+    assert_eq!(reloaded.snapshot().default_volume, 65);
+    assert_eq!(
+        reload_backend.set_calls(),
+        vec![
+            ("{0.0.1.00000000}.{mic-a}".to_string(), 0.65),
+            ("{0.0.1.00000000}.{mic-b}".to_string(), 0.65),
+        ]
+    );
+}
+
+#[test]
+fn setting_default_volume_clamps_above_100_and_is_noop_when_unchanged() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.80,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    backend.clear_set_calls();
+
+    // Setting the same Default Volume (80%) is a no-op.
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(80))
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+
+    // Values above 100 clamp to 100%.
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(150))
+        .unwrap();
+    assert_eq!(controller.snapshot().default_volume, 100);
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 1.0)]
+    );
+
+    // Repeating 100% is a no-op.
+    backend.clear_set_calls();
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(100))
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+
+    // Setting 0% enforces 0.0 and persists 0.
+    controller
+        .handle_command(AppCommand::SetDefaultVolume(0))
+        .unwrap();
+    assert_eq!(controller.snapshot().default_volume, 0);
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.0)]
+    );
+    let saved_toml = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_toml.contains("default_volume = 0"));
 }
