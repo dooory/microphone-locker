@@ -46,6 +46,10 @@ pub enum AppCommand {
         endpoint_id: String,
         lock_policy: LockPolicy,
     },
+    SetMicrophoneIgnored {
+        endpoint_id: String,
+        ignored: bool,
+    },
     ForgetMicrophone {
         endpoint_id: String,
     },
@@ -161,9 +165,43 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                     return Ok(());
                 }
 
+                entry.previous_custom_target_volume = match (entry.lock_policy, normalized_policy) {
+                    (LockPolicy::Custom(previous), LockPolicy::Ignored) => Some(previous.min(100)),
+                    _ => None,
+                };
                 entry.lock_policy = normalized_policy;
                 save_config(&self.config_path, &self.config)?;
 
+                self.enforce_active_microphone(&endpoint_id)?;
+            }
+            AppCommand::SetMicrophoneIgnored {
+                endpoint_id,
+                ignored,
+            } => {
+                let Some(entry) = self.config.microphones.get_mut(&endpoint_id) else {
+                    return Ok(());
+                };
+
+                if ignored {
+                    if entry.lock_policy == LockPolicy::Ignored {
+                        return Ok(());
+                    }
+                    entry.previous_custom_target_volume = match entry.lock_policy {
+                        LockPolicy::Custom(previous) => Some(previous.min(100)),
+                        _ => None,
+                    };
+                    entry.lock_policy = LockPolicy::Ignored;
+                } else {
+                    if entry.lock_policy != LockPolicy::Ignored {
+                        return Ok(());
+                    }
+                    entry.lock_policy = match entry.previous_custom_target_volume.take() {
+                        Some(target) => LockPolicy::Custom(target.min(100)),
+                        None => LockPolicy::FollowDefault,
+                    };
+                }
+
+                save_config(&self.config_path, &self.config)?;
                 self.enforce_active_microphone(&endpoint_id)?;
             }
             AppCommand::ForgetMicrophone { endpoint_id } => {
@@ -337,6 +375,7 @@ impl<B: AudioBackend, S: StartupRegistry> AppController<B, S> {
                     MicrophoneConfig {
                         friendly_name: friendly_name.to_string(),
                         lock_policy: LockPolicy::FollowDefault,
+                        previous_custom_target_volume: None,
                     },
                 );
                 true

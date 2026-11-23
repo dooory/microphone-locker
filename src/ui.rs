@@ -354,14 +354,9 @@ fn render_microphone_row(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let mut ignored = is_ignored;
                     if ui.checkbox(&mut ignored, "Ignored").changed() {
-                        let next_policy = if ignored {
-                            LockPolicy::Ignored
-                        } else {
-                            LockPolicy::FollowDefault
-                        };
-                        command = Some(AppCommand::SetMicrophoneLockPolicy {
+                        command = Some(AppCommand::SetMicrophoneIgnored {
                             endpoint_id: mic.endpoint_id.clone(),
-                            lock_policy: next_policy,
+                            ignored,
                         });
                     }
                 });

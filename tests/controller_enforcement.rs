@@ -1334,6 +1334,107 @@ fn setting_lock_policy_for_unknown_or_unchanged_microphone_is_noop() {
 }
 
 #[test]
+fn unignoring_custom_microphone_restores_previous_custom_target_volume_across_pause_and_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    let backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.80,
+    }]);
+
+    let mut controller = AppController::start(backend.clone(), config_path.clone()).unwrap();
+    // Set custom Target Volume to 45% (Default Volume is 80%).
+    controller
+        .handle_command(AppCommand::SetMicrophoneLockPolicy {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            lock_policy: LockPolicy::Custom(45),
+        })
+        .unwrap();
+    backend.clear_set_calls();
+
+    // Pause, then mark Ignored: remembers 45% in config.toml.
+    controller.handle_command(AppCommand::SetPaused(true)).unwrap();
+    controller
+        .handle_command(AppCommand::SetMicrophoneIgnored {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            ignored: true,
+        })
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+    assert_eq!(
+        controller.snapshot().active_microphones[0].lock_policy,
+        LockPolicy::Ignored
+    );
+    let saved_ignored = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_ignored.contains("policy = \"ignored\""));
+    assert!(saved_ignored.contains("previous_custom_target_volume = 45"));
+
+    // Un-ignore while still Paused: restores Custom(45) without enforcing until resumed.
+    controller
+        .handle_command(AppCommand::SetMicrophoneIgnored {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            ignored: false,
+        })
+        .unwrap();
+    assert!(backend.set_calls().is_empty());
+    assert_eq!(
+        controller.snapshot().active_microphones[0].lock_policy,
+        LockPolicy::Custom(45)
+    );
+
+    // Drift volume while paused, then Resume: reconciles back to 45% (not Default Volume 80%).
+    backend.set_external_volume("{0.0.1.00000000}.{mic-a}", 0.95);
+    controller
+        .handle_command(AppCommand::SetPaused(false))
+        .unwrap();
+    assert_eq!(
+        backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.45)]
+    );
+
+    // Ignoring again and restarting preserves previous_custom_target_volume across restart.
+    controller
+        .handle_command(AppCommand::SetMicrophoneIgnored {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            ignored: true,
+        })
+        .unwrap();
+    let restart_backend = FakeAudioBackend::with_microphones(vec![ActiveMicrophone {
+        endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+        friendly_name: "Blue Yeti".to_string(),
+        volume_scalar: 0.90,
+    }]);
+    let mut restarted = AppController::start(restart_backend.clone(), config_path.clone()).unwrap();
+    assert!(restart_backend.set_calls().is_empty());
+    assert_eq!(
+        restarted.snapshot().active_microphones[0].lock_policy,
+        LockPolicy::Ignored
+    );
+
+    // Un-ignoring after restart restores Custom(45), enforces 45%, and clears previous_custom_target_volume.
+    restarted
+        .handle_command(AppCommand::SetMicrophoneIgnored {
+            endpoint_id: "{0.0.1.00000000}.{mic-a}".to_string(),
+            ignored: false,
+        })
+        .unwrap();
+    assert_eq!(
+        restart_backend.set_calls(),
+        vec![("{0.0.1.00000000}.{mic-a}".to_string(), 0.45)]
+    );
+    assert_eq!(
+        restarted.snapshot().active_microphones[0].lock_policy,
+        LockPolicy::Custom(45)
+    );
+    let saved_restored = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_restored.contains("policy = \"custom\""));
+    assert!(saved_restored.contains("target_volume = 45"));
+    assert!(!saved_restored.contains("previous_custom_target_volume"));
+}
+
+#[test]
 fn pausing_suspends_enforcement_preserves_lock_policies_and_still_tracks_devices() {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");

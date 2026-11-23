@@ -32,6 +32,8 @@ pub struct MicrophoneConfig {
     pub friendly_name: String,
     #[serde(flatten)]
     pub lock_policy: LockPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_custom_target_volume: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +98,9 @@ pub fn load_config(path: &Path) -> Result<Option<AppConfig>, ConfigError> {
     for entry in config.microphones.values_mut() {
         if let LockPolicy::Custom(target) = entry.lock_policy {
             entry.lock_policy = LockPolicy::Custom(target.min(100));
+        }
+        if let Some(target) = entry.previous_custom_target_volume {
+            entry.previous_custom_target_volume = Some(target.min(100));
         }
     }
     Ok(Some(config))
