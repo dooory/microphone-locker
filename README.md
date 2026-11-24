@@ -8,9 +8,11 @@ By default, every microphone follows a global default volume, including new ones
 
 Microphone Locker runs on Windows.
 
-### Download
+### Install
 
-Download `microphone-locker.exe` from the [latest GitHub release](https://github.com/dooory/microphone-locker/releases/latest) and run it. If you plan to turn on "Start with Windows" in the app window, move the executable to a permanent folder first so Windows can find it on sign-in.
+Download and run `MicrophoneLocker-Setup.exe` from the [latest GitHub release](https://github.com/dooory/microphone-locker/releases/latest).
+
+The installer sets up Microphone Locker per-user in `%LOCALAPPDATA%\Programs\Microphone Locker` (no administrator privileges required), adds a Start Menu shortcut, optionally enables "Start with Windows", and registers an uninstaller in Windows **Installed apps**. Running a newer installer upgrades your existing installation in place while keeping your saved settings.
 
 ### Build from source
 
@@ -18,6 +20,7 @@ To build it yourself, install:
 
 - [Rust](https://www.rust-lang.org/tools/install) (stable toolchain, 2024 edition)
 - Visual Studio C++ Build Tools (the "Desktop development with C++" workload, for `link.exe`)
+- [Inno Setup 6](https://jrsoftware.org/isinfo.php) (optional, only needed to build the Windows installer)
 
 Clone the repo and run it with Cargo:
 
@@ -27,13 +30,13 @@ cd microphone-locker
 cargo run --release
 ```
 
-To build a standalone executable without running it:
+To build the Windows installer locally:
 
 ```powershell
-cargo build --release
+.\scripts\build-installer.ps1
 ```
 
-That puts the binary at `target\release\microphone-locker.exe`.
+That builds the release binary and compiles the installer to `target\installer\MicrophoneLocker-Setup.exe`.
 
 ## Contributing
 
